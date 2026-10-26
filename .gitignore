@@ -80,3 +80,4 @@ src/main/resources/cert
 /scr
 start_service.bat
 stop_service.bat
+/minio_data
