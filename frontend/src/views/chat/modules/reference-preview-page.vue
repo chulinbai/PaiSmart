@@ -23,6 +23,15 @@ const evidenceSnippet = ref('');
 const matchedChunkText = ref('');
 const score = ref<number | null>(null);
 const chunkId = ref<number | null>(null);
+const knowledgeType = ref<Api.Chat.ReferenceEvidence['knowledgeType']>(null);
+const imageText = ref('');
+const imageSourceType = ref<Api.Chat.ReferenceEvidence['imageSourceType']>(null);
+const imageUrl = ref('');
+const embeddedImageId = ref('');
+const imageSequence = ref<number | null>(null);
+const contentType = ref('');
+const width = ref<number | null>(null);
+const height = ref<number | null>(null);
 const referenceNumber = ref<number | undefined>(undefined);
 const sessionId = ref('');
 const previewKey = computed(() => String(route.query.previewKey || ''));
@@ -70,6 +79,15 @@ function syncFromStorage() {
     matchedChunkText.value = payload.matchedChunkText || matchedChunkText.value;
     score.value = payload.score ?? score.value;
     chunkId.value = payload.chunkId ?? chunkId.value;
+    knowledgeType.value = payload.knowledgeType ?? knowledgeType.value;
+    imageText.value = payload.imageText || imageText.value;
+    imageSourceType.value = payload.imageSourceType ?? imageSourceType.value;
+    imageUrl.value = payload.imageUrl || imageUrl.value;
+    embeddedImageId.value = payload.embeddedImageId || embeddedImageId.value;
+    imageSequence.value = payload.imageSequence ?? imageSequence.value;
+    contentType.value = payload.contentType || contentType.value;
+    width.value = payload.width ?? width.value;
+    height.value = payload.height ?? height.value;
     sessionId.value = payload.sessionId || sessionId.value;
     referenceNumber.value = payload.referenceNumber || referenceNumber.value;
     return true;
@@ -118,6 +136,15 @@ async function loadReferenceDetail() {
     matchedChunkText.value = data.matchedChunkText || '';
     score.value = data.score ?? null;
     chunkId.value = data.chunkId ?? null;
+    knowledgeType.value = data.knowledgeType ?? null;
+    imageText.value = data.imageText || '';
+    imageSourceType.value = data.imageSourceType ?? null;
+    imageUrl.value = data.imageUrl || '';
+    embeddedImageId.value = data.embeddedImageId || '';
+    imageSequence.value = data.imageSequence ?? null;
+    contentType.value = data.contentType || '';
+    width.value = data.width ?? null;
+    height.value = data.height ?? null;
   } catch (error: any) {
     loadError.value = error?.message || '引用详情加载失败';
   } finally {
@@ -170,6 +197,15 @@ watch(
         :matched-chunk-text="matchedChunkText"
         :score="score"
         :chunk-id="chunkId"
+        :knowledge-type="knowledgeType"
+        :image-text="imageText"
+        :image-source-type="imageSourceType"
+        :image-url="imageUrl"
+        :embedded-image-id="embeddedImageId"
+        :image-sequence="imageSequence"
+        :content-type="contentType"
+        :width="width"
+        :height="height"
         :visible="true"
         @close="handleBack"
       />

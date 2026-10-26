@@ -35,7 +35,7 @@ public class UsageBalanceQuotaService extends UsageQuotaService {
     }
 
     public TokenReservation reserveLlmTokens(String userId, int estimatedPromptTokens, int maxCompletionTokens) {
-        if (!isQuotaManaged(userId)) {
+        if (!isQuotaManaged(userId) || !isLlmUsageEnabled()) {
             return TokenReservation.noop("llm", userId);
         }
 
@@ -59,7 +59,7 @@ public class UsageBalanceQuotaService extends UsageQuotaService {
     }
 
     public TokenReservation reserveEmbeddingTokens(String userId, List<String> texts) {
-        if (!isQuotaManaged(userId)) {
+        if (!isQuotaManaged(userId) || !isEmbeddingUsageEnabled()) {
             return TokenReservation.noop("embedding", userId);
         }
 

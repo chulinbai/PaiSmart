@@ -6,8 +6,8 @@ import com.yizhaoqi.smartpai.repository.DocumentVectorRepository;
 import com.yizhaoqi.smartpai.repository.FileUploadRepository;
 import com.yizhaoqi.smartpai.repository.UserRepository;
 import com.yizhaoqi.smartpai.service.ElasticsearchService;
+import com.yizhaoqi.smartpai.service.MultimodalVectorizationService;
 import com.yizhaoqi.smartpai.service.ParseService;
-import com.yizhaoqi.smartpai.service.VectorizationService;
 import io.minio.MinioClient;
 import io.minio.PutObjectArgs;
 import org.junit.jupiter.api.Test;
@@ -30,9 +30,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
-import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -44,7 +42,7 @@ class BootstrapKnowledgeInitializerTest {
     private ParseService parseService;
 
     @Mock
-    private VectorizationService vectorizationService;
+    private MultimodalVectorizationService multimodalVectorizationService;
 
     @Mock
     private ElasticsearchService elasticsearchService;
@@ -89,12 +87,12 @@ class BootstrapKnowledgeInitializerTest {
         when(fileUploadRepository.countByFileMd5AndUserId(fileMd5, "1")).thenReturn(1L);
         when(documentVectorRepository.countByFileMd5(fileMd5)).thenReturn(2L);
         when(documentVectorRepository.countByFileMd5AndPageNumberIsNotNull(fileMd5)).thenReturn(2L);
-        when(elasticsearchService.countByFileMd5(fileMd5)).thenReturn(2L);
+        when(multimodalVectorizationService.countByFileMd5(fileMd5)).thenReturn(2L);
 
         initializer.run();
 
         verify(parseService, never()).parseAndSave(anyString(), any(), anyString(), anyString(), anyBoolean());
-        verify(vectorizationService, never()).vectorize(anyString(), anyString(), anyString(), anyBoolean(), anyString());
+        verify(multimodalVectorizationService, never()).indexFile(anyString(), anyString(), anyString(), anyString(), anyBoolean(), anyString());
         verify(fileUploadRepository, never()).save(any(FileUpload.class));
         verify(minioClient, never()).putObject(any(PutObjectArgs.class));
     }
@@ -113,15 +111,16 @@ class BootstrapKnowledgeInitializerTest {
         when(fileUploadRepository.countByFileMd5AndUserId(fileMd5, "1")).thenReturn(0L);
         when(documentVectorRepository.countByFileMd5(fileMd5)).thenReturn(0L);
         when(documentVectorRepository.countByFileMd5AndPageNumberIsNotNull(fileMd5)).thenReturn(0L);
-        when(elasticsearchService.countByFileMd5(fileMd5)).thenReturn(0L);
-        doNothing().when(vectorizationService).vectorize(fileMd5, "1", "default", true, "system-bootstrap");
+        when(multimodalVectorizationService.countByFileMd5(fileMd5)).thenReturn(0L);
+        when(multimodalVectorizationService.indexFile(fileMd5, "paismart.pdf", "1", "default", true, "system-bootstrap"))
+                .thenReturn(new MultimodalVectorizationService.MultimodalVectorizationResult(12, 3, "multimodal:test"));
         when(minioClient.putObject(any(PutObjectArgs.class))).thenReturn(null);
 
         initializer.run();
 
         verify(minioClient).putObject(any(PutObjectArgs.class));
         verify(parseService).parseAndSave(anyString(), any(), anyString(), anyString(), anyBoolean());
-        verify(vectorizationService).vectorize(fileMd5, "1", "default", true, "system-bootstrap");
+        verify(multimodalVectorizationService).indexFile(fileMd5, "paismart.pdf", "1", "default", true, "system-bootstrap");
 
         ArgumentCaptor<FileUpload> captor = ArgumentCaptor.forClass(FileUpload.class);
         verify(fileUploadRepository).save(captor.capture());
@@ -166,13 +165,13 @@ class BootstrapKnowledgeInitializerTest {
         when(fileUploadRepository.countByFileMd5AndUserId(fileMd5, "1")).thenReturn(1L);
         when(documentVectorRepository.countByFileMd5(fileMd5)).thenReturn(2L);
         when(documentVectorRepository.countByFileMd5AndPageNumberIsNotNull(fileMd5)).thenReturn(2L);
-        when(elasticsearchService.countByFileMd5(fileMd5)).thenReturn(2L);
+        when(multimodalVectorizationService.countByFileMd5(fileMd5)).thenReturn(2L);
 
         initializer.run();
 
         verify(fileUploadRepository).deleteAll(List.of(duplicate));
         verify(parseService, never()).parseAndSave(anyString(), any(), anyString(), anyString(), anyBoolean());
-        verify(vectorizationService, never()).vectorize(anyString(), anyString(), anyString(), anyBoolean(), anyString());
+        verify(multimodalVectorizationService, never()).indexFile(anyString(), anyString(), anyString(), anyString(), anyBoolean(), anyString());
     }
 
     private void configureInitializer(Path pdfPath) {

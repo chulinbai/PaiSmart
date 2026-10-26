@@ -21,7 +21,7 @@
       },
       "vector": {
         "type": "dense_vector",
-        "dims": 2048,
+        "dims": 768,
         "index": true,
         "similarity": "cosine"
       },

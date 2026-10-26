@@ -201,7 +201,7 @@ const viewerKicker = computed(() => {
     if (highlightStatus.value === 'page-only') {
       return '当前已打开引用页；图片或扫描内容需要结合左侧线索核对。';
     }
-    return '当前是定位页快照，支持缩放；整本文档请点“新窗口”查看。';
+    return '当前已定位到引用页，支持缩放、翻页和新窗口查看原文件。';
   }
   return '支持翻页、缩放和新窗口查看原文件。';
 });

@@ -16,6 +16,7 @@ public class ChatSessionRegistry {
     private static final Logger logger = LoggerFactory.getLogger(ChatSessionRegistry.class);
 
     private final ConcurrentHashMap<String, WebSocketSession> sessions = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, WebSocketSession> generationSessions = new ConcurrentHashMap<>();
     private final ObjectMapper objectMapper;
 
     public ChatSessionRegistry(ObjectMapper objectMapper) {
@@ -34,10 +35,33 @@ public class ChatSessionRegistry {
         return sessions.get(userId);
     }
 
+    public void bindGeneration(String generationId, WebSocketSession session) {
+        if (generationId != null && session != null) {
+            generationSessions.put(generationId, session);
+        }
+    }
+
+    public void unbindGeneration(String generationId) {
+        if (generationId != null) {
+            generationSessions.remove(generationId);
+        }
+    }
+
+    public void sendJsonToGeneration(String generationId, Map<String, ?> payload) {
+        sendJson(generationSessions.get(generationId), "generation " + generationId, payload);
+    }
+
+    public void sendJsonToSession(WebSocketSession session, Map<String, ?> payload) {
+        sendJson(session, session == null ? "unknown session" : "session " + session.getId(), payload);
+    }
+
     public void sendJsonToUser(String userId, Map<String, ?> payload) {
-        WebSocketSession session = sessions.get(userId);
+        sendJson(sessions.get(userId), "user " + userId, payload);
+    }
+
+    private void sendJson(WebSocketSession session, String target, Map<String, ?> payload) {
         if (session == null || !session.isOpen()) {
-            logger.debug("用户 {} 当前没有可用的 WebSocket 会话，跳过发送", userId);
+            logger.debug("No open WebSocket session for {}; skipping message", target);
             return;
         }
 
@@ -48,7 +72,7 @@ public class ChatSessionRegistry {
                 }
             }
         } catch (Exception e) {
-            logger.error("向用户 {} 发送 WebSocket 消息失败: {}", userId, e.getMessage(), e);
+            logger.error("Failed to send WebSocket message to {}: {}", target, e.getMessage(), e);
         }
     }
 }

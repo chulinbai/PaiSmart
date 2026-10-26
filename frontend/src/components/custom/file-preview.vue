@@ -83,6 +83,11 @@
               <p class="support-copy">{{ evidenceSnippet }}</p>
             </section>
 
+            <section v-else-if="imageText" class="info-card">
+              <span class="info-label">图片上下文</span>
+              <p class="support-copy">{{ imageText }}</p>
+            </section>
+
             <section v-else-if="resolvedHighlightAnchor" class="info-card">
               <span class="info-label">定位线索</span>
               <p class="support-copy">{{ resolvedHighlightAnchor }}</p>
@@ -172,6 +177,15 @@ interface Props {
   matchedChunkText?: string;
   score?: number | null;
   chunkId?: number | null;
+  knowledgeType?: Api.Chat.ReferenceEvidence['knowledgeType'];
+  imageText?: string | null;
+  imageSourceType?: Api.Chat.ReferenceEvidence['imageSourceType'];
+  imageUrl?: string | null;
+  embeddedImageId?: string | null;
+  imageSequence?: number | null;
+  contentType?: string | null;
+  width?: number | null;
+  height?: number | null;
   visible: boolean;
 }
 
@@ -204,6 +218,12 @@ const fallbackRetrievalLabel = computed(() => {
   if (props.retrievalMode === 'TEXT_ONLY') {
     return '关键词召回';
   }
+  if (props.retrievalMode === 'MULTIMODAL_TEXT_ONLY') {
+    return '多模态关键词召回';
+  }
+  if (props.retrievalMode === 'MULTIMODAL_HYBRID') {
+    return '多模态召回（图文语义 + 关键词）';
+  }
   if (props.retrievalMode === 'HYBRID') {
     return '混合召回（语义相关 + 关键词）';
   }
@@ -229,12 +249,17 @@ const displayScore = computed(() => {
 const displayPage = computed(() => sourcePageNumber.value || props.pageNumber || undefined);
 const displayPageLabel = computed(() => (displayPage.value ? `第 ${displayPage.value} 页` : ''));
 const displayScoreLabel = computed(() => (displayScore.value ? `相关分数 ${displayScore.value}` : ''));
+const displayImageSequenceLabel = computed(() => (props.imageSequence ? `第 ${props.imageSequence} 张图片` : ''));
+const displayImageSizeLabel = computed(() => {
+  if (!props.width || !props.height) return '';
+  return `${props.width}×${props.height}`;
+});
 const headerMetaLine = computed(() => {
   if (previewType.value === 'pdf') {
-    return [displayPageLabel.value, displayScore.value ? `分数 ${displayScore.value}` : ''].filter(Boolean).join(' / ');
+    return [displayPageLabel.value, displayImageSequenceLabel.value, displayScore.value ? `分数 ${displayScore.value}` : ''].filter(Boolean).join(' / ');
   }
   if (previewType.value === 'image') {
-    return [fileExtensionLabel.value, displayScore.value ? `分数 ${displayScore.value}` : ''].filter(Boolean).join(' / ');
+    return [fileExtensionLabel.value, displayPageLabel.value, displayImageSequenceLabel.value, displayImageSizeLabel.value, displayScore.value ? `分数 ${displayScore.value}` : ''].filter(Boolean).join(' / ');
   }
   if (previewType.value === 'text') {
     return [fileExtensionLabel.value, displayScore.value ? `分数 ${displayScore.value}` : ''].filter(Boolean).join(' / ');
@@ -242,6 +267,12 @@ const headerMetaLine = computed(() => {
   return [fileExtensionLabel.value, displayScore.value ? `分数 ${displayScore.value}` : ''].filter(Boolean).join(' / ');
 });
 const heroHeadline = computed(() => {
+  if (props.knowledgeType === 'DOCUMENT_IMAGE') {
+    return 'PDF 内嵌图片命中';
+  }
+  if (props.knowledgeType === 'STANDALONE_IMAGE') {
+    return '独立图片命中';
+  }
   if (props.retrievalLabel || fallbackRetrievalLabel.value) {
     return props.retrievalLabel || fallbackRetrievalLabel.value;
   }
@@ -251,6 +282,12 @@ const heroHeadline = computed(() => {
   return '已就绪的引用文档';
 });
 const heroDescription = computed(() => {
+  if (props.knowledgeType === 'DOCUMENT_IMAGE') {
+    return '右侧展示的是从原 PDF 按页码和图片序号即时提取的图片，左侧保留本次检索使用的图文上下文。';
+  }
+  if (props.knowledgeType === 'STANDALONE_IMAGE') {
+    return '右侧展示的是独立上传到 MinIO 的图片，左侧保留本次检索使用的图片上下文。';
+  }
   if (props.retrievalQuery) {
     return '左侧展示的是本次 RAG 检索的问题与定位线索，右侧则直接打开原始文档，方便核对答案依据。';
   }
@@ -321,6 +358,9 @@ async function loadPreviewContent() {
   console.log('[文件预览] 开始加载预览内容:', {
     fileName: props.fileName,
     fileMd5: props.fileMd5,
+    knowledgeType: props.knowledgeType,
+    imageSourceType: props.imageSourceType,
+    imageSequence: props.imageSequence,
     visible: props.visible
   });
 
@@ -334,6 +374,44 @@ async function loadPreviewContent() {
   previewType.value = 'text';
 
   try {
+    if (props.knowledgeType === 'DOCUMENT_IMAGE' && props.fileMd5 && props.pageNumber && props.imageSequence) {
+      const { error: requestError, data } = await request<{
+        fileName: string;
+        fileMd5: string;
+        previewType: 'image';
+        previewUrl: string;
+        sourcePageNumber?: number;
+        imageSequence?: number;
+        contentType?: string;
+      }>({
+        url: '/documents/embedded-image-preview',
+        params: {
+          fileMd5: props.fileMd5,
+          pageNumber: props.pageNumber,
+          imageSequence: props.imageSequence
+        }
+      });
+
+      if (requestError) {
+        error.value = '预览失败：' + (requestError.message || '未知错误');
+      } else if (data) {
+        previewType.value = 'image';
+        previewUrl.value = data.previewUrl || '';
+        sourceUrl.value = data.previewUrl || '';
+        sourcePageNumber.value = data.sourcePageNumber || props.pageNumber;
+        content.value = props.imageText || props.matchedChunkText || '';
+      }
+      return;
+    }
+
+    if (props.knowledgeType === 'STANDALONE_IMAGE' && props.imageUrl && !props.fileMd5) {
+      previewType.value = 'image';
+      previewUrl.value = props.imageUrl;
+      sourceUrl.value = props.imageUrl;
+      content.value = props.imageText || props.matchedChunkText || '';
+      return;
+    }
+
     // 优先使用 MD5 预览（如果存在）
     if (props.fileMd5) {
       console.log('[文件预览] 使用MD5模式预览，请求参数:', {

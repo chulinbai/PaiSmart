@@ -8,9 +8,15 @@ import SvgIcon from '@/components/custom/svg-icon.vue';
 import FilePreview from '@/components/custom/file-preview.vue';
 import UploadDialog from './modules/upload-dialog.vue';
 import SearchDialog from './modules/search-dialog.vue';
+import KnowledgeIndexStatus from './modules/knowledge-index-status.vue';
 
 const appStore = useAppStore();
 const authStore = useAuthStore();
+const multiIndexEnabled = ref(false);
+onMounted(async () => {
+  const result = await request<{ enabled: boolean }>({ url: '/knowledge/capabilities' });
+  multiIndexEnabled.value = Boolean(result.data?.enabled);
+});
 
 // 文件预览相关状态
 const previewVisible = ref(false);
@@ -136,6 +142,17 @@ const { columns, columnChecks, data, getData, loading, mobilePagination } = useT
       title: '上传状态',
       width: 100,
       render: row => renderStatus(row.status, row.progress)
+    },
+    {
+      key: 'id',
+      title: '知识索引',
+      minWidth: 220,
+      render: row =>
+        multiIndexEnabled.value && row.id ? (
+          <KnowledgeIndexStatus documentId={row.id} canManage={String(row.userId) === String(authStore.userInfo.id)} />
+        ) : (
+          <span class="text-secondary">沿用原文检索</span>
+        )
     },
     {
       key: 'orgTagName',

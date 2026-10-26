@@ -1,0 +1,16 @@
+fastapi
+uvicorn[standard]
+pydantic
+accelerate
+pillow
+numpy
+torch
+torchvision
+transformers
+qwen-vl-utils
+requests
+av
+sentence-transformers
+scipy
+opencv-python-headless
+decord

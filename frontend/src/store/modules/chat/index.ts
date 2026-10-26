@@ -1,5 +1,6 @@
 import { useWebSocket } from '@vueuse/core';
 import { request } from '@/service/request';
+import { applyTerminalSnapshot, generationDisplayStatus, isTerminalGeneration, normalizeHistoryMessage } from '@/utils/chat-generation';
 
 export const useChatStore = defineStore(SetupStoreId.Chat, () => {
   const NON_RETRYABLE_CLOSE_CODES = new Set([1002, 1003, 1007, 1008]);
@@ -8,10 +9,13 @@ export const useChatStore = defineStore(SetupStoreId.Chat, () => {
 
   const conversationId = ref<string>('');
   const input = ref<Api.Chat.Input>({ message: '' });
+  const regenerationRequest = ref<{ question: string; nonce: number } | null>(null);
   const list = ref<Api.Chat.Message[]>([]);
   const sessions = ref<Api.Chat.ConversationSession[]>([]);
   const sessionsLoading = ref(false);
   const activeTab = ref<'active' | 'archived'>('active');
+  const contextStatus = ref<Api.Chat.ContextStatus | null>(null);
+  const contextLoading = ref(false);
 
   const store = useAuthStore();
 
@@ -25,16 +29,7 @@ export const useChatStore = defineStore(SetupStoreId.Chat, () => {
   let rateLimitTimer: ReturnType<typeof setInterval> | null = null;
 
   function mapGenerationStatus(status?: Api.Chat.GenerationStatus): Api.Chat.Message['status'] {
-    if (status === 'COMPLETED' || status === 'CANCELLED') {
-      return 'finished';
-    }
-    if (status === 'FAILED') {
-      return 'error';
-    }
-    if (status === 'STREAMING') {
-      return 'loading';
-    }
-    return 'pending';
+    return generationDisplayStatus(status);
   }
 
   function findAssistantIndexByGenerationId(generationId?: string) {
@@ -68,14 +63,26 @@ export const useChatStore = defineStore(SetupStoreId.Chat, () => {
 
     const assistantIndex = findAssistantIndexByGenerationId(snapshot.generationId);
     const nextStatus = mapGenerationStatus(snapshot.status);
+    const snapshotContent =
+      snapshot.content || (snapshot.status === 'FAILED' ? snapshot.errorMessage || '响应已中断，可重新发送问题。' : '');
 
     if (assistantIndex >= 0) {
       const assistant = list.value[assistantIndex];
-      assistant.content = snapshot.content || assistant.content || '';
+      if (isTerminalGeneration(assistant.generationStatus)) return;
+      if (isTerminalGeneration(snapshot.status)) {
+        applyTerminalSnapshot(assistant, snapshot);
+        return;
+      }
+      assistant.generationStatus = snapshot.status;
+      assistant.persistenceStatus = snapshot.persistenceStatus;
+      assistant.content = snapshotContent || assistant.content || '';
       assistant.status = nextStatus;
       assistant.generationId = snapshot.generationId;
       assistant.conversationId = snapshot.conversationId;
       assistant.timestamp ||= snapshot.updatedAt;
+      assistant.finishReason = snapshot.finishReason;
+      assistant.truncated = snapshot.truncated;
+      assistant.continuationAttempts = snapshot.continuationAttempts;
       if (snapshot.referenceMappings && Object.keys(snapshot.referenceMappings).length > 0) {
         assistant.referenceMappings = snapshot.referenceMappings;
       }
@@ -91,11 +98,18 @@ export const useChatStore = defineStore(SetupStoreId.Chat, () => {
     });
     list.value.push({
       role: 'assistant',
-      content: snapshot.content || '',
+      generationStatus: snapshot.status,
+      terminalToken: isTerminalGeneration(snapshot.status) ? snapshot.token : undefined,
+      lastSequence: snapshot.lastSequence,
+      persistenceStatus: snapshot.persistenceStatus,
+      content: snapshotContent,
       status: nextStatus,
       conversationId: snapshot.conversationId,
       generationId: snapshot.generationId,
       timestamp: snapshot.updatedAt,
+      finishReason: snapshot.finishReason,
+      truncated: snapshot.truncated,
+      continuationAttempts: snapshot.continuationAttempts,
       referenceMappings: snapshot.referenceMappings
     });
   }
@@ -123,13 +137,37 @@ export const useChatStore = defineStore(SetupStoreId.Chat, () => {
     return data || null;
   }
 
+  async function fetchConversationRecoverySnapshot(targetConversationId?: string) {
+    const cid = targetConversationId || conversationId.value;
+    if (!cid) {
+      return null;
+    }
+    const { error, data } = await request<Api.Chat.GenerationSnapshot | null>({
+      url: `chat/conversations/${cid}/recovery`
+    });
+    if (error) {
+      return null;
+    }
+    return data || null;
+  }
+
   async function syncGenerationAfterReconnect() {
     const pendingGenerationId = getPendingGenerationId();
     if (pendingGenerationId) {
-      upsertGenerationSnapshot(await fetchGenerationSnapshot(pendingGenerationId));
+      const pendingSnapshot = await fetchGenerationSnapshot(pendingGenerationId);
+      if (pendingSnapshot) {
+        upsertGenerationSnapshot(pendingSnapshot);
+        return;
+      }
+    }
+
+    const activeSnapshot = await fetchActiveGenerationSnapshot();
+    if (activeSnapshot) {
+      upsertGenerationSnapshot(activeSnapshot);
       return;
     }
-    upsertGenerationSnapshot(await fetchActiveGenerationSnapshot());
+
+    upsertGenerationSnapshot(await fetchConversationRecoverySnapshot());
   }
 
   // ---- Session management ----
@@ -160,6 +198,7 @@ export const useChatStore = defineStore(SetupStoreId.Chat, () => {
     if (!error && data) {
       conversationId.value = data.conversationId;
       list.value = [];
+      contextStatus.value = null;
       await loadSessions();
     }
     return !error;
@@ -179,6 +218,8 @@ export const useChatStore = defineStore(SetupStoreId.Chat, () => {
     conversationId.value = targetConversationId;
     list.value = [];
     await loadMessages(targetConversationId);
+    await loadContextStatus();
+    upsertGenerationSnapshot(await fetchConversationRecoverySnapshot(targetConversationId));
   }
 
   async function loadMessages(targetConversationId?: string) {
@@ -191,7 +232,7 @@ export const useChatStore = defineStore(SetupStoreId.Chat, () => {
       params: { conversationId: cid }
     });
     if (!error && data) {
-      list.value = data;
+      list.value = data.map(normalizeHistoryMessage);
     }
   }
 
@@ -217,6 +258,54 @@ export const useChatStore = defineStore(SetupStoreId.Chat, () => {
     if (!error) {
       await loadSessions();
     }
+  }
+
+  async function loadContextStatus() {
+    if (!conversationId.value) {
+      contextStatus.value = null;
+      return;
+    }
+    contextLoading.value = true;
+    const { error, data } = await request<Api.Chat.ContextStatus>({
+      url: `chat/conversations/${conversationId.value}/context`
+    });
+    if (!error && data) contextStatus.value = data;
+    contextLoading.value = false;
+  }
+
+  async function compactContext() {
+    if (!conversationId.value) return false;
+    const { error } = await request({
+      url: `chat/conversations/${conversationId.value}/context/compact`,
+      method: 'POST'
+    });
+    if (!error) await loadContextStatus();
+    return !error;
+  }
+
+  async function resetContext() {
+    if (!conversationId.value) return false;
+    const { error } = await request({
+      url: `chat/conversations/${conversationId.value}/context/reset`,
+      method: 'POST'
+    });
+    if (!error) await loadContextStatus();
+    return !error;
+  }
+
+  function updateContextStatus(payload: Record<string, any>) {
+    if (!payload.contextWindowTokens) return;
+    contextStatus.value = {
+      contextWindowTokens: Number(payload.contextWindowTokens),
+      promptBudgetTokens: contextStatus.value?.promptBudgetTokens || 0,
+      contextUsedTokens: Number(payload.contextUsedTokens || 0),
+      contextUsageRatio: Number(payload.contextUsageRatio || 0),
+      breakdown: contextStatus.value?.breakdown || {},
+      snapshotVersion: Number(payload.snapshotVersion || 0),
+      contextDegraded: Boolean(payload.contextDegraded),
+      trimReasons: contextStatus.value?.trimReasons || [],
+      eventCount: contextStatus.value?.eventCount || 0
+    };
   }
 
   const filteredSessions = computed(() => {
@@ -388,11 +477,14 @@ export const useChatStore = defineStore(SetupStoreId.Chat, () => {
   });
 
   return {
+    regenerationRequest,
     input,
     conversationId,
     list,
     sessions,
     sessionsLoading,
+    contextStatus,
+    contextLoading,
     activeTab,
     filteredSessions,
     connectionStatus,
@@ -409,6 +501,7 @@ export const useChatStore = defineStore(SetupStoreId.Chat, () => {
     startRateLimitCountdown,
     handleAuthReset,
     fetchGenerationSnapshot,
+    fetchConversationRecoverySnapshot,
     upsertGenerationSnapshot,
     syncGenerationAfterReconnect,
     loadSessions,
@@ -416,6 +509,10 @@ export const useChatStore = defineStore(SetupStoreId.Chat, () => {
     switchSession,
     loadMessages,
     archiveSession,
-    unarchiveSession
+    unarchiveSession,
+    loadContextStatus,
+    compactContext,
+    resetContext,
+    updateContextStatus
   };
 });

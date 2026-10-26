@@ -253,6 +253,7 @@ declare namespace Api {
       apiBaseUrl: string;
       model: string;
       dimension: number | null;
+      contextWindowTokens: number | null;
       enabled: boolean;
       active: boolean;
       hasApiKey: boolean;
@@ -328,10 +329,25 @@ declare namespace Api {
 
     interface SearchResult {
       fileMd5: string;
-      chunkId: number;
-      textContent: string;
+      chunkId?: number | null;
+      textContent?: string | null;
       score: number;
       fileName: string;
+      pageNumber?: number | null;
+      anchorText?: string | null;
+      retrievalMode?: 'HYBRID' | 'TEXT_ONLY' | 'MULTIMODAL_HYBRID' | 'MULTIMODAL_TEXT_ONLY' | string | null;
+      matchedChunkText?: string | null;
+      itemId?: string | null;
+      knowledgeType?: 'TEXT_CHUNK' | 'DOCUMENT_IMAGE' | 'STANDALONE_IMAGE' | string | null;
+      searchText?: string | null;
+      imageText?: string | null;
+      imageSourceType?: 'MINIO_OBJECT' | 'DOCUMENT_EMBEDDED' | string | null;
+      imageUrl?: string | null;
+      embeddedImageId?: string | null;
+      imageSequence?: number | null;
+      contentType?: string | null;
+      width?: number | null;
+      height?: number | null;
     }
 
     interface UploadState {
@@ -392,20 +408,36 @@ declare namespace Api {
   }
 
   namespace Chat {
-    type GenerationStatus = 'STREAMING' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
+    type GenerationStatus = 'STREAMING' | 'FINALIZING' | 'COMPLETED' | 'INCOMPLETE' | 'REJECTED' | 'FAILED' | 'CANCELLED' | 'RECOVERABLE';
 
     interface ReferenceEvidence {
+      sourceId?: string;
+      documentId?: number;
+      chunkSetId?: number;
       fileMd5: string;
       fileName: string;
       pageNumber?: number | null;
       anchorText?: string | null;
-      retrievalMode?: 'HYBRID' | 'TEXT_ONLY' | null;
+      retrievalMode?: 'HYBRID' | 'TEXT_ONLY' | 'MULTIMODAL_HYBRID' | 'MULTIMODAL_TEXT_ONLY' | string | null;
       retrievalLabel?: string | null;
       retrievalQuery?: string | null;
       matchedChunkText?: string | null;
       evidenceSnippet?: string | null;
       score?: number | null;
       chunkId?: number | null;
+      itemId?: string | null;
+      knowledgeType?: 'TEXT_CHUNK' | 'DOCUMENT_IMAGE' | 'STANDALONE_IMAGE' | string | null;
+      searchText?: string | null;
+      imageText?: string | null;
+      imageSourceType?: 'MINIO_OBJECT' | 'DOCUMENT_EMBEDDED' | string | null;
+      imageUrl?: string | null;
+      bucketName?: string | null;
+      objectName?: string | null;
+      embeddedImageId?: string | null;
+      imageSequence?: number | null;
+      contentType?: string | null;
+      width?: number | null;
+      height?: number | null;
     }
 
     interface Input {
@@ -429,6 +461,10 @@ declare namespace Api {
     }
 
     interface Message {
+      generationStatus?: GenerationStatus;
+      terminalToken?: string;
+      lastSequence?: number;
+      persistenceStatus?: 'PENDING' | 'DELAYED' | 'SAVED';
       role: 'user' | 'assistant';
       content: string;
       status?: 'pending' | 'loading' | 'finished' | 'error';
@@ -439,6 +475,9 @@ declare namespace Api {
       referenceMappings?: Record<string, ReferenceEvidence>;
       toolEvents?: AgentToolEvent[];
       feedbackRating?: 'good' | 'bad';
+      finishReason?: string;
+      truncated?: boolean;
+      continuationAttempts?: number;
     }
 
     interface Token {
@@ -446,6 +485,9 @@ declare namespace Api {
     }
 
     interface GenerationSnapshot {
+      token?: string;
+      lastSequence?: number;
+      persistenceStatus?: 'PENDING' | 'DELAYED' | 'SAVED';
       generationId: string;
       userId: string;
       conversationId: string;
@@ -455,6 +497,9 @@ declare namespace Api {
       createdAt: string;
       updatedAt: string;
       errorMessage?: string | null;
+      finishReason?: string;
+      truncated?: boolean;
+      continuationAttempts?: number;
       referenceMappings?: Record<string, ReferenceEvidence>;
     }
 
@@ -465,6 +510,18 @@ declare namespace Api {
       status: 'ACTIVE' | 'ARCHIVED';
       createdAt: string;
       updatedAt: string;
+    }
+
+    interface ContextStatus {
+      contextWindowTokens: number;
+      promptBudgetTokens: number;
+      contextUsedTokens: number;
+      contextUsageRatio: number;
+      breakdown: Record<string, number>;
+      snapshotVersion: number;
+      contextDegraded: boolean;
+      trimReasons: string[];
+      eventCount: number;
     }
   }
 

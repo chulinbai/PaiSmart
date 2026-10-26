@@ -44,9 +44,11 @@ spring:
     consumer:
       group-id: file-processing-group
       auto-offset-reset: earliest
+      max-poll-records: 1
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
       value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
       properties:
+        max.poll.interval.ms: ${SPRING_KAFKA_CONSUMER_MAX_POLL_INTERVAL_MS:3600000}
         spring.json.trusted.packages: "*"
         client.dns.lookup: use_all_dns_ips
     topic:
@@ -152,6 +154,7 @@ elasticsearch:
   username: ${ELASTICSEARCH_USERNAME:elastic}
   password: ${ELASTICSEARCH_PASSWORD:}
   insecure-trust-all-certificates: ${ELASTICSEARCH_INSECURE_TRUST_ALL_CERTIFICATES:true}
+  bulk-size: ${ELASTICSEARCH_BULK_SIZE:500}
 
 security:
   # 容器部署时请显式填写前端实际访问域名，支持 Origin pattern
@@ -173,10 +176,13 @@ deepseek:
 
 embedding:
   api:
-    url: ${EMBEDDING_API_URL:https://dashscope.aliyuncs.com/compatible-mode/v1}
+    url: ${EMBEDDING_API_URL:http://127.0.0.1:11435/v1/embeddings}
     key: ${EMBEDDING_API_KEY:}
-    model: ${EMBEDDING_API_MODEL:text-embedding-v4}
+    model: ${EMBEDDING_API_MODEL:MedAIBase/Qwen3-VL-Embedding:2b}
     batch-size: ${EMBEDDING_BATCH_SIZE:10}
+    local-batch-size: ${EMBEDDING_LOCAL_BATCH_SIZE:1}
+    local-delay-ms: ${EMBEDDING_LOCAL_DELAY_MS:75}
+    request-timeout-seconds: ${EMBEDDING_REQUEST_TIMEOUT_SECONDS:60}
     dimension: ${EMBEDDING_DIMENSION:2048}
 
 ai:

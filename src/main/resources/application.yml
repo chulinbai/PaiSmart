@@ -10,6 +10,11 @@ spring:
     username: ${SPRING_DATASOURCE_USERNAME:root}
     password: ${SPRING_DATASOURCE_PASSWORD:}
     driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      connection-timeout: ${DB_CONNECTION_TIMEOUT_MS:5000}
+      data-source-properties:
+        connectTimeout: ${DB_CONNECT_TIMEOUT_MS:5000}
+        socketTimeout: ${DB_SOCKET_TIMEOUT_MS:5000}
   jpa:
     hibernate:
       ddl-auto: ${SPRING_JPA_HIBERNATE_DDL_AUTO:update}
@@ -24,6 +29,8 @@ spring:
       host: ${SPRING_DATA_REDIS_HOST:localhost}
       port: ${SPRING_DATA_REDIS_PORT:6379}
       password: ${SPRING_DATA_REDIS_PASSWORD:}
+      timeout: ${SPRING_DATA_REDIS_TIMEOUT:5s}
+      connect-timeout: ${SPRING_DATA_REDIS_CONNECT_TIMEOUT:5s}
   servlet:
     multipart:
       enabled: true
@@ -44,9 +51,11 @@ spring:
     consumer:
       group-id: file-processing-group
       auto-offset-reset: earliest
+      max-poll-records: 1
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
       value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
       properties:
+        max.poll.interval.ms: ${SPRING_KAFKA_CONSUMER_MAX_POLL_INTERVAL_MS:3600000}
         spring.json.trusted.packages: "*"
         client.dns.lookup: use_all_dns_ips
     topic:
@@ -167,6 +176,25 @@ aliyun:
     callback-token: ${ALIYUN_OCR_CALLBACK_TOKEN:}
 
 knowledge:
+  rag:
+    enabled: ${KNOWLEDGE_RAG_ENABLED:false}
+    initialize-schema: ${KNOWLEDGE_RAG_INITIALIZE_SCHEMA:false}
+    parser-version: ${KNOWLEDGE_PARSER_VERSION:liteparse-chunks-images-v1}
+    extraction-version: ${KNOWLEDGE_EXTRACTION_VERSION:graph-extraction-v1}
+    chunk-index-prefix: ${KNOWLEDGE_CHUNK_INDEX_PREFIX:knowledge_chunks}
+    embedding-batch-size: ${KNOWLEDGE_EMBEDDING_BATCH_SIZE:16}
+    evidence-characters: ${KNOWLEDGE_EVIDENCE_CHARACTERS:24000}
+    tool-timeout-seconds: ${KNOWLEDGE_TOOL_TIMEOUT_SECONDS:90}
+    max-decision-rounds: ${KNOWLEDGE_MAX_DECISION_ROUNDS:4}
+    max-tool-calls: ${KNOWLEDGE_MAX_TOOL_CALLS:8}
+  graph:
+    enabled: ${KNOWLEDGE_GRAPH_ENABLED:false}
+    initialize-schema: ${KNOWLEDGE_GRAPH_INITIALIZE_SCHEMA:false}
+    topic: ${KNOWLEDGE_GRAPH_TOPIC:knowledge-graph-work}
+    consumer-group: ${KNOWLEDGE_GRAPH_GROUP:knowledge-graph-workers}
+    index-prefix: ${KNOWLEDGE_GRAPH_INDEX_PREFIX:knowledge_graph}
+    lease-seconds: ${KNOWLEDGE_LEASE_SECONDS:600}
+    max-attempts: ${KNOWLEDGE_MAX_ATTEMPTS:5}
   bootstrap:
     enabled: ${KNOWLEDGE_BOOTSTRAP_ENABLED:true}
     path: ${KNOWLEDGE_BOOTSTRAP_PATH:docs/paismart.pdf}
@@ -185,6 +213,7 @@ elasticsearch:
   insecure-trust-all-certificates: ${ELASTICSEARCH_INSECURE_TRUST_ALL_CERTIFICATES:true}
   init:
     enabled: ${ELASTICSEARCH_INIT_ENABLE:true}
+  bulk-size: ${ELASTICSEARCH_BULK_SIZE:500}
 
 security:
   # WebSocket 与浏览器跨域白名单，支持 Origin pattern，多个来源用逗号分隔
@@ -213,12 +242,31 @@ deepseek:
 
 embedding:
   api:
-    # 向量服务配置
-    url: ${EMBEDDING_API_URL:https://dashscope.aliyuncs.com/compatible-mode/v1}
+    # 向量服务统一使用多模态 Qwen3-VL
+    url: ${EMBEDDING_API_URL:http://127.0.0.1:11435/v1/embeddings}
     key: ${EMBEDDING_API_KEY:}
-    model: ${EMBEDDING_API_MODEL:text-embedding-v4}
+    model: ${EMBEDDING_API_MODEL:MedAIBase/Qwen3-VL-Embedding:2b}
     batch-size: ${EMBEDDING_BATCH_SIZE:10}
+    local-batch-size: ${EMBEDDING_LOCAL_BATCH_SIZE:1}
+    local-delay-ms: ${EMBEDDING_LOCAL_DELAY_MS:75}
+    request-timeout-seconds: ${EMBEDDING_REQUEST_TIMEOUT_SECONDS:60}
     dimension: ${EMBEDDING_DIMENSION:2048}
+
+multimodal:
+  elasticsearch:
+    index-name: ${MULTIMODAL_ES_INDEX_NAME:knowledge_multimodal}
+  embedding:
+    api:
+      url: ${MULTIMODAL_EMBEDDING_API_URL:http://127.0.0.1:11435/v1/embeddings}
+      key: ${MULTIMODAL_EMBEDDING_API_KEY:}
+      model: ${MULTIMODAL_EMBEDDING_API_MODEL:MedAIBase/Qwen3-VL-Embedding:2b}
+      dimension: ${MULTIMODAL_EMBEDDING_DIMENSION:2048}
+      batch-size: ${MULTIMODAL_EMBEDDING_BATCH_SIZE:4}
+      request-timeout-seconds: ${MULTIMODAL_EMBEDDING_REQUEST_TIMEOUT_SECONDS:300}
+      max-in-memory-mb: ${MULTIMODAL_EMBEDDING_MAX_IN_MEMORY_MB:128}
+  pdf-image:
+    max-images-per-file: ${MULTIMODAL_PDF_IMAGE_MAX_IMAGES_PER_FILE:200}
+    context-max-chars: ${MULTIMODAL_PDF_IMAGE_CONTEXT_MAX_CHARS:1200}
 
 ai:
   prompt:

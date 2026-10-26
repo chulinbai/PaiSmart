@@ -125,6 +125,45 @@ public class ConversationService {
         return result;
     }
 
+    @Transactional
+    public Map<String, Object> copyConversationSession(Long userId, String sourceConversationId) {
+        ConversationSession sourceSession = sessionRepository.findByConversationId(sourceConversationId)
+                .orElseThrow(() -> new CustomException("源对话不存在", HttpStatus.NOT_FOUND));
+        if (!sourceSession.getUser().getId().equals(userId)) {
+            throw new CustomException("无权复制该对话", HttpStatus.FORBIDDEN);
+        }
+
+        User user = userRepository.findById(userId)
+                .orElseThrow(() -> new CustomException("User not found", HttpStatus.NOT_FOUND));
+        String copiedConversationId = UUID.randomUUID().toString();
+
+        ConversationSession copiedSession = new ConversationSession();
+        copiedSession.setUser(user);
+        copiedSession.setConversationId(copiedConversationId);
+        copiedSession.setTitle((sourceSession.getTitle() == null ? "新对话" : sourceSession.getTitle()) + "（测压副本）");
+        copiedSession.setStatus(ConversationSession.SessionStatus.ACTIVE);
+        copiedSession.setWorkspaceId(sourceSession.getWorkspaceId());
+        sessionRepository.save(copiedSession);
+
+        for (Conversation source : conversationRepository.findByConversationIdOrderByTimestampAsc(sourceConversationId)) {
+            Conversation copied = new Conversation();
+            copied.setUser(user);
+            copied.setQuestion(source.getQuestion());
+            copied.setAnswer(source.getAnswer());
+            copied.setConversationId(copiedConversationId);
+            copied.setReferenceMappingsJson(source.getReferenceMappingsJson());
+            copied.setAnswerStatus(source.getAnswerStatus());copied.setFinishReason(source.getFinishReason());copied.setResponseMetadataJson(source.getResponseMetadataJson());
+            conversationRepository.save(copied);
+        }
+
+        return Map.of(
+                "conversationId", copiedConversationId,
+                "sourceConversationId", sourceConversationId,
+                "title", copiedSession.getTitle(),
+                "messageCount", conversationRepository.findByConversationIdOrderByTimestampAsc(copiedConversationId).size()
+        );
+    }
+
     public void ensureConversationSession(Long userId, String conversationId, String title) {
         if (sessionRepository.existsByConversationId(conversationId)) {
             return;
@@ -270,14 +309,19 @@ public class ConversationService {
                             null,
                             includeUsername ? conversation.getUser().getUsername() : null
                     ));
-                    messages.add(buildMessage(
+                    Map<String,Object> assistant=buildMessage(
                             "assistant",
                             conversation.getAnswer(),
                             timestamp,
                             messageConversationId,
                             parseReferenceMappings(conversation.getReferenceMappingsJson()),
                             includeUsername ? conversation.getUser().getUsername() : null
-                    ));
+                    );
+                    assistant.put("generationId",conversation.getGenerationId());
+                    assistant.put("status",conversation.getAnswerStatus()==null?"COMPLETED":conversation.getAnswerStatus());
+                    assistant.put("finishReason",conversation.getFinishReason());
+                    assistant.put("truncated","INCOMPLETE".equals(conversation.getAnswerStatus()));
+                    messages.add(assistant);
                 });
 
         return messages;

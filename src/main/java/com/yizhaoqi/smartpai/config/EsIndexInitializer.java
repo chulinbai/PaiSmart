@@ -33,8 +33,14 @@ public class EsIndexInitializer implements CommandLineRunner {
     @Autowired
     private ElasticsearchClient esClient;
 
-    @Value("classpath:es-mappings/knowledge_base.json") // 加载 JSON 文件
-    private org.springframework.core.io.Resource mappingResource;
+    @Value("classpath:es-mappings/knowledge_base.json")
+    private org.springframework.core.io.Resource knowledgeBaseMappingResource;
+
+    @Value("classpath:es-mappings/knowledge_multimodal.json")
+    private org.springframework.core.io.Resource knowledgeMultimodalMappingResource;
+
+    @Value("${multimodal.elasticsearch.index-name:knowledge_multimodal}")
+    private String multimodalIndexName;
 
     @Value("${elasticsearch.host}")
     private String host;
@@ -51,8 +57,8 @@ public class EsIndexInitializer implements CommandLineRunner {
     @Override
     public void run(String... args) throws Exception {
         try {
-            logger.info("正在初始化索引 'knowledge_base'... endpoint={}://{}:{}, username={}",
-                    scheme, host, port, maskUsername(username));
+            logger.info("正在初始化 Elasticsearch 索引... endpoint={}://{}:{}, username={}, multimodalIndex={}",
+                    scheme, host, port, maskUsername(username), multimodalIndexName);
             initializeIndex();
         } catch (Exception exception) {
             // 特别处理连接关闭异常，尝试重新连接
@@ -81,11 +87,16 @@ public class EsIndexInitializer implements CommandLineRunner {
      */
     private void initializeIndex() throws Exception {
         // 检查索引是否存在
-        BooleanResponse existsResponse = esClient.indices().exists(ExistsRequest.of(e -> e.index("knowledge_base")));
+        initializeIndexIfMissing("knowledge_base", knowledgeBaseMappingResource);
+        initializeIndexIfMissing(multimodalIndexName, knowledgeMultimodalMappingResource);
+    }
+
+    private void initializeIndexIfMissing(String indexName, org.springframework.core.io.Resource mapping) throws Exception {
+        BooleanResponse existsResponse = esClient.indices().exists(ExistsRequest.of(e -> e.index(indexName)));
         if (!existsResponse.value()) {
-            createIndex();
+            createIndex(indexName, mapping);
         } else {
-            logger.info("索引 'knowledge_base' 已存在");
+            logger.info("索引 '{}' 已存在", indexName);
         }
     }
 
@@ -93,7 +104,7 @@ public class EsIndexInitializer implements CommandLineRunner {
      * 创建索引
      * @throws Exception
      */
-    private void createIndex() throws Exception {
+    private void createIndex(String indexName, org.springframework.core.io.Resource mappingResource) throws Exception {
         // 读取 JSON 文件内容，使用 InputStream 方式支持 JAR 包内资源
         String mappingJson;
         try (var inputStream = mappingResource.getInputStream()) {
@@ -101,11 +112,11 @@ public class EsIndexInitializer implements CommandLineRunner {
         }
         // 创建索引并应用映射
         CreateIndexRequest createIndexRequest = CreateIndexRequest.of(c -> c
-                .index("knowledge_base") // 索引名称
+                .index(indexName) // 索引名称
                 .withJson(new StringReader(mappingJson)) // 使用 JSON 文件定义映射
         );
         esClient.indices().create(createIndexRequest);
-        logger.info("索引 'knowledge_base' 已创建");
+        logger.info("索引 '{}' 已创建", indexName);
     }
 
     private String buildDiagnosticMessage(Exception exception) {

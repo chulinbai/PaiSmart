@@ -9,6 +9,9 @@ import java.util.Optional;
 
 @Repository
 public interface ConversationSessionRepository extends JpaRepository<ConversationSession, Long> {
+    @org.springframework.data.jpa.repository.Lock(jakarta.persistence.LockModeType.PESSIMISTIC_WRITE)
+    @org.springframework.data.jpa.repository.Query("select s from ConversationSession s where s.conversationId=:id")
+    Optional<ConversationSession> lock(@org.springframework.data.repository.query.Param("id") String id);
 
     List<ConversationSession> findByUserIdAndStatusOrderByUpdatedAtDesc(Long userId, ConversationSession.SessionStatus status);
 

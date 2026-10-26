@@ -31,7 +31,7 @@ function highlight(text: string) {
 async function search() {
   loading.value = true;
   const { error, data } = await request<Api.KnowledgeBase.SearchResult[]>({
-    url: 'search/hybrid',
+    url: 'search/multimodal',
     params: model.value
   });
   if (!error) {
@@ -52,6 +52,25 @@ watch(visible, () => {
     reset();
   }
 });
+
+function getKnowledgeTypeLabel(item: Api.KnowledgeBase.SearchResult) {
+  if (item.knowledgeType === 'DOCUMENT_IMAGE') return 'PDF 图片';
+  if (item.knowledgeType === 'STANDALONE_IMAGE') return '独立图片';
+  if (item.knowledgeType === 'TEXT_CHUNK') return '文本片段';
+  return '知识片段';
+}
+
+function getDisplayText(item: Api.KnowledgeBase.SearchResult) {
+  return item.textContent || item.imageText || item.searchText || item.matchedChunkText || '';
+}
+
+function getMetaLine(item: Api.KnowledgeBase.SearchResult) {
+  const parts = [];
+  if (item.pageNumber) parts.push(`第 ${item.pageNumber} 页`);
+  if (item.imageSequence) parts.push(`第 ${item.imageSequence} 张图片`);
+  if (item.width && item.height) parts.push(`${item.width}×${item.height}`);
+  return parts.join(' / ');
+}
 </script>
 
 <template>
@@ -118,13 +137,25 @@ watch(visible, () => {
           }"
         >
           <div class="relative">
+            <div class="mb-2 flex flex-wrap items-center gap-2 pr-28">
+              <NTag size="small" :bordered="false" type="info">
+                {{ getKnowledgeTypeLabel(item) }}
+              </NTag>
+              <span v-if="getMetaLine(item)" class="text-xs text-gray-500">{{ getMetaLine(item) }}</span>
+            </div>
+            <img
+              v-if="item.knowledgeType === 'STANDALONE_IMAGE' && item.imageUrl"
+              :src="item.imageUrl"
+              :alt="item.fileName"
+              class="mb-3 h-120px max-w-220px rounded-8px object-contain"
+            />
             <NHighlight
-              v-if="highlight(item.textContent)"
+              v-if="highlight(getDisplayText(item))"
               highlight-class="bg-[rgb(var(--primary-400-color))] color-white px-2 mx-1 rd-sm"
-              :text="item.textContent"
+              :text="getDisplayText(item)"
               :patterns="patterns"
             />
-            <span v-else>{{ item.textContent }}</span>
+            <span v-else>{{ getDisplayText(item) }}</span>
             <NTag
               :bordered="false"
               draggable

@@ -1,0 +1,17 @@
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import ts from 'typescript';
+const source=readFileSync(new URL('../src/utils/chat-generation.ts',import.meta.url),'utf8');
+const javascript=ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.ESNext,target:ts.ScriptTarget.ES2022}}).outputText;
+const {applyGenerationChunk,applyTerminalSnapshot,normalizeHistoryMessage}=await import(`data:text/javascript;base64,${Buffer.from(javascript).toString('base64')}`);
+const message={role:'assistant',content:''};
+assert.equal(applyGenerationChunk(message,{chunk:'first',sequence:1}),true);
+assert.equal(applyGenerationChunk(message,{chunk:'duplicate',sequence:1}),false);
+assert.equal(applyTerminalSnapshot(message,{status:'INCOMPLETE',content:'first + final snapshot',token:'frozen',lastSequence:3,referenceMappings:{1:{fileMd5:'file'}}}),true);
+assert.equal(applyGenerationChunk(message,{chunk:'late',sequence:2}),false);
+assert.equal(applyTerminalSnapshot(message,{status:'COMPLETED',content:'overwrite',token:'other'}),false);
+assert.equal(message.content,'first + final snapshot');assert.equal(message.referenceMappings[1].fileMd5,'file');
+assert.equal(message.generationStatus,'INCOMPLETE');assert.equal(message.status,'finished');
+assert.equal(normalizeHistoryMessage({role:'assistant',content:'part',status:'CANCELLED'}).generationStatus,'CANCELLED');
+assert.equal(applyGenerationChunk({role:'assistant',content:'part',generationStatus:'FINALIZING'},{chunk:'late',sequence:2}),false);
+console.log('chat generation event ordering: 11 assertions passed');

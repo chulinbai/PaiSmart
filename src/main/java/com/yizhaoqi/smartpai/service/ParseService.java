@@ -4,6 +4,8 @@ import com.yizhaoqi.smartpai.model.DocumentVector;
 import com.yizhaoqi.smartpai.repository.DocumentVectorRepository;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.pdfbox.pdmodel.PDDocument;
+import org.apache.pdfbox.text.PDFTextStripper;
 import org.apache.tika.exception.TikaException;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.parser.ParseContext;
@@ -34,6 +36,7 @@ public class ParseService {
 
     private static final Logger logger = LoggerFactory.getLogger(ParseService.class);
     private static final String PDF_PARSER_LITEPARSE = "liteparse";
+    private static final String PDF_PARSER_PDFBOX = "pdfbox";
     private static final Pattern LITEPARSE_PAGE_FOOTER_PATTERN = Pattern.compile("(?i)^No\\.\\s*\\d+\\s*/\\s*\\d+%?$");
 
     @Autowired
@@ -127,7 +130,7 @@ public class ParseService {
         try (BufferedInputStream bufferedStream = new BufferedInputStream(fileStream, bufferSize)) {
             if (isPdfDocument(bufferedStream)) {
                 parsePdfAndSave(fileMd5, bufferedStream, userId, orgTag, isPublic);
-                logger.info("PDF 文件 LiteParse 页级解析和入库完成，fileMd5: {}", fileMd5);
+                logger.info("PDF page-aware parsing and indexing completed, fileMd5: {}", fileMd5);
                 return;
             }
 
@@ -324,7 +327,7 @@ public class ParseService {
     }
 
     private void parsePdfAndSave(String fileMd5, InputStream fileStream, String userId, String orgTag, boolean isPublic) throws IOException {
-        List<LiteParsePage> pages = parsePdfWithLiteParse(fileStream);
+        List<LiteParsePage> pages = parsePdfPages(fileStream);
         int savedChunkCount = 0;
 
         for (LiteParsePage page : pages) {
@@ -339,7 +342,7 @@ public class ParseService {
     }
 
     private EmbeddingEstimate estimatePdfEmbeddingUsage(InputStream fileStream) throws IOException {
-        List<LiteParsePage> pages = parsePdfWithLiteParse(fileStream);
+        List<LiteParsePage> pages = parsePdfPages(fileStream);
         long estimatedTokens = 0L;
         int estimatedChunkCount = 0;
 
@@ -357,21 +360,39 @@ public class ParseService {
         return new EmbeddingEstimate(estimatedTokens, estimatedChunkCount);
     }
 
-    private List<LiteParsePage> parsePdfWithLiteParse(InputStream fileStream) throws IOException {
-        if (!PDF_PARSER_LITEPARSE.equalsIgnoreCase(pdfParsingEngine)) {
-            throw new IOException("不支持的 PDF 解析引擎: " + pdfParsingEngine);
-        }
+    private List<LiteParsePage> parsePdfPages(InputStream fileStream) throws IOException {
+        Path inputPath = Files.createTempFile("paismart-pdf-", ".pdf");
+        try {
+            Files.copy(fileStream, inputPath, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
 
-        Path inputPath = Files.createTempFile("paismart-liteparse-", ".pdf");
+            if (PDF_PARSER_LITEPARSE.equalsIgnoreCase(pdfParsingEngine)) {
+                try {
+                    return parsePdfWithLiteParse(inputPath);
+                } catch (LiteParseUnavailableException e) {
+                    logger.warn("LiteParse unavailable, falling back to PDFBox for PDF parsing: {}", e.getMessage());
+                    return parsePdfWithPdfBox(inputPath);
+                }
+            }
+
+            if (PDF_PARSER_PDFBOX.equalsIgnoreCase(pdfParsingEngine)) {
+                logger.info("PDF parser engine configured as PDFBox: inputPath={}", inputPath);
+                return parsePdfWithPdfBox(inputPath);
+            }
+
+            throw new IOException("Unsupported PDF parser engine: " + pdfParsingEngine);
+        } finally {
+            deleteQuietly(inputPath);
+        }
+    }
+
+    private List<LiteParsePage> parsePdfWithLiteParse(Path inputPath) throws IOException {
         Path outputPath = Files.createTempFile("paismart-liteparse-", ".json");
         Path stdoutPath = Files.createTempFile("paismart-liteparse-", ".out");
         Path stderrPath = Files.createTempFile("paismart-liteparse-", ".err");
 
         try {
-            Files.copy(fileStream, inputPath, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-
             List<String> command = buildLiteParseCommand(inputPath, outputPath);
-            logger.info("调用 LiteParse 解析 PDF: command={}", maskLiteParseCommand(command));
+            logger.info("Calling LiteParse for PDF parsing: command={}", maskLiteParseCommand(command));
 
             Process process;
             try {
@@ -381,7 +402,10 @@ public class ParseService {
                 applyLiteParseEnvironment(processBuilder);
                 process = processBuilder.start();
             } catch (IOException e) {
-                throw new IOException("启动 LiteParse 失败，请确认已安装 lit 命令或配置 file.parsing.liteparse.command: " + liteParseCommand, e);
+                throw new LiteParseUnavailableException(
+                        "Failed to start LiteParse. Please install the lit command or configure file.parsing.liteparse.command: " + liteParseCommand,
+                        e
+                );
             }
 
             boolean finished;
@@ -389,31 +413,48 @@ public class ParseService {
                 finished = process.waitFor(liteParseTimeoutSeconds, TimeUnit.SECONDS);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
-                throw new IOException("等待 LiteParse 解析被中断", e);
+                throw new IOException("Interrupted while waiting for LiteParse", e);
             }
 
             if (!finished) {
                 process.destroyForcibly();
-                throw new IOException("LiteParse 解析超时: " + liteParseTimeoutSeconds + " 秒");
+                throw new IOException("LiteParse timed out after " + liteParseTimeoutSeconds + " seconds");
             }
 
             int exitCode = process.exitValue();
             if (exitCode != 0) {
                 String stderr = readProcessLog(stderrPath);
                 String stdout = readProcessLog(stdoutPath);
-                throw new IOException("LiteParse 解析失败，exitCode=" + exitCode
+                throw new IOException("LiteParse failed, exitCode=" + exitCode
                         + ", stderr=" + stderr + ", stdout=" + stdout);
             }
 
             return readLiteParsePages(outputPath);
         } finally {
-            deleteQuietly(inputPath);
             deleteQuietly(outputPath);
             deleteQuietly(stdoutPath);
             deleteQuietly(stderrPath);
         }
     }
 
+    private List<LiteParsePage> parsePdfWithPdfBox(Path inputPath) throws IOException {
+        try (PDDocument document = PDDocument.load(inputPath.toFile())) {
+            PDFTextStripper stripper = new PDFTextStripper();
+            stripper.setSortByPosition(true);
+
+            int totalPages = Math.min(document.getNumberOfPages(), liteParseMaxPages);
+            List<LiteParsePage> pages = new ArrayList<>(totalPages);
+            for (int pageNumber = 1; pageNumber <= totalPages; pageNumber++) {
+                stripper.setStartPage(pageNumber);
+                stripper.setEndPage(pageNumber);
+                String pageText = stripper.getText(document);
+                pages.add(new LiteParsePage(pageNumber, normalizeLiteParseText(pageText)));
+            }
+            return pages;
+        } catch (IOException e) {
+            throw new IOException("PDFBox failed to parse PDF", e);
+        }
+    }
     private List<String> buildLiteParseCommand(Path inputPath, Path outputPath) {
         List<String> command = new ArrayList<>();
         command.add(liteParseCommand);
@@ -843,6 +884,12 @@ public class ParseService {
         }
 
         return normalized.substring(Math.max(0, normalized.length() - maxLength));
+    }
+
+    private static final class LiteParseUnavailableException extends IOException {
+        private LiteParseUnavailableException(String message, Throwable cause) {
+            super(message, cause);
+        }
     }
 
     private record LiteParsePage(int pageNumber, String text) {

@@ -28,20 +28,22 @@ public class AgentToolRegistry {
     private static final int DEFAULT_TOP_K = 5;
     private static final int MAX_SEARCH_DOCS = 20;
 
-    private final HybridSearchService hybridSearchService;
+    private final MultimodalSearchService multimodalSearchService;
     private final DeepSeekClient deepSeekClient;
     private final StringRedisTemplate stringRedisTemplate;
     private final ElasticsearchClient elasticsearchClient;
     private final FileUploadRepository fileUploadRepository;
     private final List<AgentTool> tools;
     private final Map<String, ToolHandler> handlers;
+    @org.springframework.beans.factory.annotation.Autowired(required=false)
+    private com.yizhaoqi.smartpai.service.knowledge.KnowledgeRetrievalService knowledgeRetrieval;
 
-    public AgentToolRegistry(HybridSearchService hybridSearchService,
+    public AgentToolRegistry(MultimodalSearchService multimodalSearchService,
                              DeepSeekClient deepSeekClient,
                              StringRedisTemplate stringRedisTemplate,
                              ElasticsearchClient elasticsearchClient,
                              FileUploadRepository fileUploadRepository) {
-        this.hybridSearchService = hybridSearchService;
+        this.multimodalSearchService = multimodalSearchService;
         this.deepSeekClient = deepSeekClient;
         this.stringRedisTemplate = stringRedisTemplate;
         this.elasticsearchClient = elasticsearchClient;
@@ -61,11 +63,12 @@ public class AgentToolRegistry {
     }
 
     public List<AgentTool> getTools() {
+        if(knowledgeRetrieval!=null) return List.of(retrievalTool(false),retrievalTool(true),submitFeedbackTool(),knowledgeStatsTool());
         return tools;
     }
 
     public Optional<AgentTool> getTool(String name) {
-        return tools.stream()
+        return getTools().stream()
                 .filter(tool -> tool.name().equals(name))
                 .findFirst();
     }
@@ -78,11 +81,67 @@ public class AgentToolRegistry {
                                            Map<String, Object> arguments,
                                            String userId,
                                            Consumer<String> onChunk) {
+        validateArguments(name,arguments==null?Collections.emptyMap():arguments);
+        if(knowledgeRetrieval!=null && ("search_knowledge".equals(name) || "search_graph".equals(name))) {
+            var args=arguments==null?Collections.<String,Object>emptyMap():arguments;
+            var type="search_graph".equals(name)?com.yizhaoqi.smartpai.service.knowledge.KnowledgeTypes.IndexType.GRAPH:com.yizhaoqi.smartpai.service.knowledge.KnowledgeTypes.IndexType.CHUNK;
+            List<Long> documentIds=args.get("documentIds") instanceof List<?> ids?ids.stream().map(id->Long.valueOf(String.valueOf(id))).toList():List.of();
+            var request=new com.yizhaoqi.smartpai.service.knowledge.KnowledgeTypes.RetrievalRequest(type,getRequiredString(args,"query"),getOptionalString(args,"mode"),getInt(args,"topK",5,1,20),documentIds);
+            var result=knowledgeRetrieval.retrieve(request,userId);
+            return new ToolExecutionResult(name,result.executionStatus()!=com.yizhaoqi.smartpai.service.knowledge.KnowledgeTypes.Status.FAILED,
+                "检索状态："+result.executionStatus(),Map.of(),false,result);
+        }
+        if(knowledgeRetrieval!=null && "generate_summary".equals(name)) throw new IllegalArgumentException("请通过检索证据生成最终摘要");
         ToolHandler handler = handlers.get(name);
         if (handler == null) {
             throw new IllegalArgumentException("未注册的工具: " + name);
         }
         return handler.execute(arguments == null ? Collections.emptyMap() : arguments, userId, onChunk);
+    }
+
+    private AgentTool retrievalTool(boolean graph) {
+        Map<String,Object> properties=new LinkedHashMap<>();properties.put("query",stringSchema("保留问题中的实体、关系与限定词"));
+        properties.put("topK",Map.of("type","integer","minimum",1,"maximum",20));
+        properties.put("mode",Map.of("type","string","enum",graph?List.of("local","global","hybrid"):List.of("vector","keyword","hybrid")));
+        properties.put("documentIds",Map.of("type","array","items",Map.of("type","integer"),"maxItems",200));
+        return new AgentTool(graph?"search_graph":"search_knowledge",graph?"检索实体与有向关系，适合关联、依赖、跨文档比较。local 从实体扩展，global 从关系主题扩展，hybrid 组合。返回原文来源，结构化解释需核对原文。":"检索原文和图片，适合具体条款、细节、原话及图片问题。支持 vector/keyword/hybrid，默认 hybrid。可以与 search_graph 同轮调用。",objectSchema(properties,List.of("query")));
+    }
+
+    public void validateArguments(String name,Map<String,Object> arguments) {
+        AgentTool tool=getTool(name).orElseThrow(()->new IllegalArgumentException("未注册的工具: "+name));
+        validateValue(arguments,tool.parameters(),"arguments");
+    }
+    @SuppressWarnings("unchecked")
+    private void validateValue(Object value,Map<String,Object> schema,String path) {
+        String type=String.valueOf(schema.get("type"));
+        switch(type) {
+            case "object" -> {
+                if(!(value instanceof Map<?,?> map)) throw new IllegalArgumentException(path+" 必须是对象");
+                Map<String,Object> properties=(Map<String,Object>)schema.getOrDefault("properties",Map.of());
+                for(Object required:(List<?>)schema.getOrDefault("required",List.of()))
+                    if(!map.containsKey(required) || map.get(required)==null || map.get(required) instanceof String s && s.isBlank())
+                        throw new IllegalArgumentException(path+" 缺少 "+required);
+                for(var item:map.entrySet()) {
+                    if(!properties.containsKey(item.getKey())) throw new IllegalArgumentException(path+" 包含未知参数 "+item.getKey());
+                    validateValue(item.getValue(),(Map<String,Object>)properties.get(item.getKey()),path+"."+item.getKey());
+                }
+            }
+            case "string" -> {if(!(value instanceof String))throw new IllegalArgumentException(path+" 必须是字符串");}
+            case "integer" -> {
+                if(!(value instanceof Number number) || !Double.isFinite(number.doubleValue()) || number.doubleValue()!=Math.rint(number.doubleValue()))
+                    throw new IllegalArgumentException(path+" 必须是整数");
+                double n=((Number)value).doubleValue();
+                if(schema.get("minimum") instanceof Number min && n<min.doubleValue() || schema.get("maximum") instanceof Number max && n>max.doubleValue())
+                    throw new IllegalArgumentException(path+" 超出范围");
+            }
+            case "array" -> {
+                if(!(value instanceof List<?> list))throw new IllegalArgumentException(path+" 必须是数组");
+                if(schema.get("maxItems") instanceof Number max && list.size()>max.intValue())throw new IllegalArgumentException(path+" 超出长度");
+                for(Object element:list)validateValue(element,(Map<String,Object>)schema.get("items"),path+"[]");
+            }
+            default -> throw new IllegalArgumentException("Unsupported tool schema");
+        }
+        if(schema.get("enum") instanceof List<?> allowed && !allowed.contains(value))throw new IllegalArgumentException(path+" 枚举值无效");
     }
 
     private ToolExecutionResult executeSearchKnowledge(Map<String, Object> arguments,
@@ -92,7 +151,7 @@ public class AgentToolRegistry {
         String query = getRequiredString(arguments, "query");
         int topK = getInt(arguments, "topK", DEFAULT_TOP_K, 1, MAX_SEARCH_DOCS);
 
-        List<SearchResult> results = hybridSearchService.searchWithPermission(query, userId, topK);
+        List<SearchResult> results = multimodalSearchService.searchWithPermission(query, userId, topK);
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("query", query);
         data.put("topK", topK);
@@ -107,7 +166,7 @@ public class AgentToolRegistry {
         String topic = getRequiredString(arguments, "topic");
         int maxDocs = getInt(arguments, "maxDocs", DEFAULT_TOP_K, 1, MAX_SEARCH_DOCS);
 
-        List<SearchResult> results = hybridSearchService.searchWithPermission(topic, userId, maxDocs);
+        List<SearchResult> results = multimodalSearchService.searchWithPermission(topic, userId, maxDocs);
         String summary = deepSeekClient.summarize(userId, topic, results, onChunk);
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("topic", topic);
@@ -179,7 +238,7 @@ public class AgentToolRegistry {
     private AgentTool searchKnowledgeTool() {
         return new AgentTool(
                 "search_knowledge",
-                "在知识库中搜索与用户问题相关的文档片段。当用户问题的答案可能依赖已上传资料、企业/项目/产品/系统内部信息、专有名词、事实依据、定义、功能、使用方式、实现细节、背景、流程或引用来源时应调用；即使用户没有明确说“查询知识库”，只要问题不像纯通用常识也应先检索。普通问候、闲聊、纯创作、翻译、通用代码/常识问题，或用户明确要求不要查知识库时不要调用。",
+                "在知识库中搜索与用户问题相关的文档片段或图片证据。当用户问题的答案可能依赖已上传资料、企业/项目/产品/系统内部信息、专有名词、事实依据、定义、功能、使用方式、实现细节、背景、流程、图表、截图或引用来源时应调用；即使用户没有明确说“查询知识库”，只要问题不像纯通用常识也应先检索。普通问候、闲聊、纯创作、翻译、通用代码/常识问题，或用户明确要求不要查知识库时不要调用。",
                 objectSchema(Map.of(
                         "query", stringSchema("用于知识库检索的查询语句。应保留用户原话中的核心实体、缩写和限定词，可包含原始问句和必要的等价改写；不要替换成固定关键词。"),
                         "topK", integerSchema("返回的片段数量，默认 5。")
@@ -239,6 +298,7 @@ public class AgentToolRegistry {
         Map<String, Object> schema = new LinkedHashMap<>();
         schema.put("type", "integer");
         schema.put("description", description);
+        schema.put("minimum",1);schema.put("maximum",MAX_SEARCH_DOCS);
         return schema;
     }
 
@@ -248,7 +308,7 @@ public class AgentToolRegistry {
         }
 
         StringBuilder output = new StringBuilder("检索到 ").append(results.size()).append(" 个知识库片段。")
-                .append("请基于这些片段回答用户问题；不得声称知识库暂无相关信息。")
+                .append("请基于这些文本片段或图片证据回答用户问题；不得声称知识库暂无相关信息。")
                 .append("如果片段信息不足，请说明“基于已检索片段只能确认……”并标注来源编号。");
         for (int i = 0; i < results.size(); i++) {
             SearchResult result = results.get(i);
@@ -256,10 +316,16 @@ public class AgentToolRegistry {
             if (result.getFileName() != null && !result.getFileName().isBlank()) {
                 output.append(result.getFileName()).append(" ");
             }
+            if (result.getKnowledgeType() != null && !result.getKnowledgeType().isBlank()) {
+                output.append("[").append(result.getKnowledgeType()).append("] ");
+            }
             output.append("(fileMd5=").append(result.getFileMd5())
                     .append(", chunkId=").append(result.getChunkId());
             if (result.getPageNumber() != null) {
                 output.append(", page=").append(result.getPageNumber());
+            }
+            if (result.getImageSequence() != null) {
+                output.append(", image=").append(result.getImageSequence());
             }
             if (result.getScore() != null) {
                 output.append(", score=").append(String.format(Locale.ROOT, "%.4f", result.getScore()));
@@ -354,13 +420,15 @@ public class AgentToolRegistry {
             boolean success,
             String content,
             Map<String, Object> data,
-            boolean streamedToUser
+            boolean streamedToUser,
+            com.yizhaoqi.smartpai.service.knowledge.KnowledgeTypes.RetrievalResult retrievalResult
     ) {
         public ToolExecutionResult(String toolName,
                                    boolean success,
                                    String content,
                                    Map<String, Object> data) {
-            this(toolName, success, content, data, false);
+            this(toolName, success, content, data, false,null);
         }
+        public ToolExecutionResult(String name,boolean success,String content,Map<String,Object> data,boolean streamed) { this(name,success,content,data,streamed,null); }
     }
 }

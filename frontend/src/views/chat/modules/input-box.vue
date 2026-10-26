@@ -1,6 +1,27 @@
 <script setup lang="ts">
+import { applyGenerationChunk, applyTerminalSnapshot, isTerminalGeneration } from '@/utils/chat-generation';
 const chatStore = useChatStore();
-const { connectionStatus, input, isRateLimited, list, rateLimitRemainingSeconds, wsData } = storeToRefs(chatStore);
+const {
+  connectionStatus,
+  contextLoading,
+  contextStatus,
+  input,
+  isRateLimited,
+  list,
+  rateLimitRemainingSeconds,
+  wsData
+} = storeToRefs(chatStore);
+
+const contextPercent = computed(() => Math.min(100, Math.round((contextStatus.value?.contextUsageRatio || 0) * 100)));
+const contextBreakdown = computed(() => Object.entries(contextStatus.value?.breakdown || {}));
+
+async function compactContext() {
+  if (await chatStore.compactContext()) window.$message?.success('上下文压缩完成');
+}
+
+async function resetContext() {
+  if (await chatStore.resetContext()) window.$message?.success('线程上下文已重置');
+}
 
 function buildWsErrorMessage(data: Record<string, any>) {
   if (data.code === 429) {
@@ -80,6 +101,7 @@ function findAssistantMessage(generationId?: string) {
   }
 
   const latest = list.value[list.value.length - 1];
+  if (generationId && latest?.generationId) return null;
   if (latest?.role === 'assistant') {
     return latest;
   }
@@ -88,6 +110,7 @@ function findAssistantMessage(generationId?: string) {
 }
 
 function handleStartPayload(assistant: Api.Chat.Message, payload: Record<string, any>) {
+  chatStore.updateContextStatus(payload);
   assistant.generationId = payload.generationId || assistant.generationId;
   assistant.conversationId = payload.conversationId || assistant.conversationId;
   if (!assistant.timestamp && payload.timestamp) {
@@ -96,6 +119,8 @@ function handleStartPayload(assistant: Api.Chat.Message, payload: Record<string,
 }
 
 function handleCompletionPayload(assistant: Api.Chat.Message, payload: Record<string, any>) {
+  if (!applyTerminalSnapshot(assistant, payload)) return;
+  chatStore.updateContextStatus(payload);
   if (payload.status === 'finished' && assistant.status !== 'error') {
     assistant.status = 'finished';
   } else if (payload.status === 'failed') {
@@ -105,7 +130,14 @@ function handleCompletionPayload(assistant: Api.Chat.Message, payload: Record<st
   if (payload.referenceMappings) {
     assistant.referenceMappings = payload.referenceMappings;
   }
-  markExecutingToolsAsSuccess(assistant);
+  assistant.finishReason = payload.finishReason || assistant.finishReason;
+  assistant.truncated = Boolean(payload.truncated);
+  assistant.continuationAttempts = Number(payload.continuationAttempts || 0);
+  if (assistant.generationStatus !== 'COMPLETED') {
+    markExecutingToolsAsFailed(assistant);
+  } else {
+    markExecutingToolsAsSuccess(assistant);
+  }
   stopGenerationStatusMonitor();
 }
 
@@ -136,8 +168,7 @@ function handleErrorPayload(assistant: Api.Chat.Message, payload: Record<string,
 }
 
 function handleChunkPayload(assistant: Api.Chat.Message, payload: Record<string, any>) {
-  assistant.status = 'loading';
-  assistant.content += payload.chunk;
+  if (!applyGenerationChunk(assistant, payload)) return;
   lastStreamContentLength = assistant.content.length;
   lastStreamContentChangedAt = Date.now();
 }
@@ -164,7 +195,7 @@ function startGenerationStatusMonitor() {
       stopGenerationStatusMonitor();
       return;
     }
-    if (Date.now() - startedAt > 130_000) {
+    if (Date.now() - startedAt > 130_000 && assistant.generationStatus !== 'FINALIZING') {
       stopGenerationStatusMonitor();
       return;
     }
@@ -184,7 +215,8 @@ function startGenerationStatusMonitor() {
     chatStore.upsertGenerationSnapshot(snapshot);
     const refreshedAssistant = findAssistantMessage(snapshot.generationId);
     if (refreshedAssistant?.status === 'finished') {
-      markExecutingToolsAsSuccess(refreshedAssistant);
+      if (refreshedAssistant.generationStatus === 'COMPLETED') markExecutingToolsAsSuccess(refreshedAssistant);
+      else markExecutingToolsAsFailed(refreshedAssistant);
       stopGenerationStatusMonitor();
     } else if (refreshedAssistant?.status === 'error') {
       markExecutingToolsAsFailed(refreshedAssistant);
@@ -273,6 +305,13 @@ watch(wsData, val => {
   const assistant = findAssistantMessage(payload.generationId);
 
   if (!assistant) return;
+  if (assistant.terminalToken || isTerminalGeneration(assistant.generationStatus)) return;
+  if (payload.type === 'persistence_status') {
+    assistant.generationStatus = 'FINALIZING';
+    assistant.persistenceStatus = payload.persistenceStatus;
+    assistant.status = 'loading';
+    return;
+  }
 
   if (payload.type === 'start') {
     handleStartPayload(assistant, payload);
@@ -324,8 +363,8 @@ const handleSend = async () => {
       })
     );
 
-    list.value[list.value.length - 1].status = 'finished';
-    if (!latestMessage.value.content) list.value.pop();
+    latestMessage.value.generationStatus = 'FINALIZING';
+    latestMessage.value.persistenceStatus = 'PENDING';
     return;
   }
 
@@ -345,6 +384,11 @@ const handleSend = async () => {
 };
 
 const inputRef = ref();
+watch(() => chatStore.regenerationRequest, async request => {
+  if (!request || isSending.value) return;
+  input.value.message = request.question;
+  await handleSend();
+});
 const insertNewline = () => {
   const textarea = inputRef.value;
   const start = textarea.selectionStart;
@@ -419,6 +463,61 @@ onUnmounted(() => {
         <span v-if="isRateLimited" class="text-11px text-[rgb(var(--primary-color))]">
           {{ cooldownText }}
         </span>
+        <NPopover trigger="click" placement="top-start" :width="300" @update:show="show => show && chatStore.loadContextStatus()">
+          <template #trigger>
+            <NTooltip>
+              <template #trigger>
+                <button
+                  class="h-6 inline-flex items-center gap-1 border-0 bg-transparent px-1 text-11px color-#999 hover:color-[rgb(var(--primary-color))]"
+                  aria-label="上下文状态"
+                >
+                  <icon-material-symbols:data-usage-rounded class="text-15px" />
+                  <span>{{ contextPercent }}%</span>
+                </button>
+              </template>
+              上下文状态
+            </NTooltip>
+          </template>
+          <div class="space-y-3 text-12px">
+            <div class="flex items-center justify-between">
+              <strong class="text-13px">上下文</strong>
+              <span :class="contextStatus?.contextDegraded ? 'text-orange-500' : 'color-#999'">
+                {{ contextStatus?.contextDegraded ? '已裁剪' : `摘要 v${contextStatus?.snapshotVersion || 0}` }}
+              </span>
+            </div>
+            <NProgress
+              type="line"
+              :percentage="contextPercent"
+              :height="7"
+              :show-indicator="false"
+              :status="contextPercent >= 85 ? 'warning' : 'default'"
+            />
+            <div class="flex justify-between color-#777 dark:color-#aaa">
+              <span>{{ (contextStatus?.contextUsedTokens || 0).toLocaleString() }} tokens</span>
+              <span>{{ (contextStatus?.contextWindowTokens || 0).toLocaleString() }} 窗口</span>
+            </div>
+            <div v-if="contextBreakdown.length" class="grid grid-cols-2 gap-x-4 gap-y-1 color-#777 dark:color-#aaa">
+              <template v-for="[name, tokens] in contextBreakdown" :key="name">
+                <span>{{ name }}</span><span class="text-right">{{ tokens.toLocaleString() }}</span>
+              </template>
+            </div>
+            <div class="flex justify-end gap-2 border-t border-#eee pt-2 dark:border-#333">
+              <NButton size="tiny" :loading="contextLoading" @click="compactContext">
+                <template #icon><icon-material-symbols:compress-rounded /></template>
+                压缩
+              </NButton>
+              <NPopconfirm @positive-click="resetContext">
+                <template #trigger>
+                  <NButton size="tiny" type="warning" ghost>
+                    <template #icon><icon-material-symbols:restart-alt-rounded /></template>
+                    重置
+                  </NButton>
+                </template>
+                后续请求将忽略当前边界前的线程上下文。
+              </NPopconfirm>
+            </div>
+          </div>
+        </NPopover>
       </div>
       <span class="text-11px color-#bbb">Shift+Enter 换行</span>
     </div>

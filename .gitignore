@@ -74,3 +74,9 @@ frontend/AutoClaw.pem
 *.pem
 src/main/resources/cert
 /.runtime
+
+
+/data
+/scr
+start_service.bat
+stop_service.bat

@@ -6,8 +6,8 @@ import com.yizhaoqi.smartpai.repository.DocumentVectorRepository;
 import com.yizhaoqi.smartpai.repository.FileUploadRepository;
 import com.yizhaoqi.smartpai.repository.UserRepository;
 import com.yizhaoqi.smartpai.service.ElasticsearchService;
+import com.yizhaoqi.smartpai.service.MultimodalVectorizationService;
 import com.yizhaoqi.smartpai.service.ParseService;
-import com.yizhaoqi.smartpai.service.VectorizationService;
 import io.minio.MinioClient;
 import io.minio.PutObjectArgs;
 import io.minio.RemoveObjectArgs;
@@ -43,12 +43,18 @@ public class BootstrapKnowledgeInitializer implements CommandLineRunner {
     private static final Logger logger = LoggerFactory.getLogger(BootstrapKnowledgeInitializer.class);
 
     private final ParseService parseService;
-    private final VectorizationService vectorizationService;
+    private final MultimodalVectorizationService multimodalVectorizationService;
     private final ElasticsearchService elasticsearchService;
     private final FileUploadRepository fileUploadRepository;
     private final DocumentVectorRepository documentVectorRepository;
     private final MinioClient minioClient;
     private final UserRepository userRepository;
+    @org.springframework.beans.factory.annotation.Autowired(required=false)
+    private com.yizhaoqi.smartpai.service.knowledge.KnowledgeIndexOrchestrator knowledgeIndexes;
+    @org.springframework.beans.factory.annotation.Autowired
+    private com.yizhaoqi.smartpai.service.knowledge.KnowledgeSourceAssembler knowledgeSources;
+    @org.springframework.beans.factory.annotation.Autowired
+    private com.yizhaoqi.smartpai.service.DocumentService documents;
 
     @Value("${knowledge.bootstrap.path:docs/paismart.pdf}")
     private String bootstrapDocumentPath;
@@ -69,14 +75,14 @@ public class BootstrapKnowledgeInitializer implements CommandLineRunner {
     private String adminUsername;
 
     public BootstrapKnowledgeInitializer(ParseService parseService,
-                                         VectorizationService vectorizationService,
+                                         MultimodalVectorizationService multimodalVectorizationService,
                                          ElasticsearchService elasticsearchService,
                                          FileUploadRepository fileUploadRepository,
                                          DocumentVectorRepository documentVectorRepository,
                                          MinioClient minioClient,
                                          UserRepository userRepository) {
         this.parseService = parseService;
-        this.vectorizationService = vectorizationService;
+        this.multimodalVectorizationService = multimodalVectorizationService;
         this.elasticsearchService = elasticsearchService;
         this.fileUploadRepository = fileUploadRepository;
         this.documentVectorRepository = documentVectorRepository;
@@ -96,6 +102,22 @@ public class BootstrapKnowledgeInitializer implements CommandLineRunner {
         String fileMd5 = calculateMd5(documentPath);
         long totalSize = Files.size(documentPath);
         String ownerUserId = resolveOwnerUserId();
+
+        if(knowledgeIndexes!=null) {
+            for(var old:fileUploadRepository.findByUserIdAndFileNameOrderByCreatedAtDesc(ownerUserId,fileName))
+                if(!fileMd5.equals(old.getFileMd5())) documents.deleteDocument(old.getFileMd5(),ownerUserId);
+            uploadToMinio(documentPath,fileMd5);
+            if(documentVectorRepository.countByFileMd5(fileMd5)==0)
+                try(var stream=Files.newInputStream(documentPath)) { parseService.parseAndSave(fileMd5,stream,ownerUserId,bootstrapOrgTag,bootstrapPublic); }
+            var file=fileUploadRepository.findFirstByFileMd5AndUserIdOrderByCreatedAtDesc(fileMd5,ownerUserId).orElseGet(()->{
+                var created=new FileUpload();created.setFileMd5(fileMd5);created.setFileName(fileName);created.setTotalSize(totalSize);
+                created.setStatus(1);created.setUserId(ownerUserId);created.setOrgTag(bootstrapOrgTag);created.setPublic(bootstrapPublic);
+                created.setMergedAt(LocalDateTime.now());created.setVectorizationStatus(FileUpload.VECTORIZATION_STATUS_PROCESSING);
+                return fileUploadRepository.saveAndFlush(created);
+            });
+            knowledgeIndexes.acceptSources(file.getId(),knowledgeSources.assemble(file),ownerUserId);
+            logger.info("启动知识库已提交多索引构建: documentId={}",file.getId());return;
+        }
 
         cleanupBootstrapHistory(fileName, fileMd5, ownerUserId);
 
@@ -147,7 +169,7 @@ public class BootstrapKnowledgeInitializer implements CommandLineRunner {
         long fileRecordCount = fileUploadRepository.countByFileMd5AndUserId(fileMd5, ownerUserId);
         long vectorCount = documentVectorRepository.countByFileMd5(fileMd5);
         long pageAwareVectorCount = documentVectorRepository.countByFileMd5AndPageNumberIsNotNull(fileMd5);
-        long esCount = elasticsearchService.countByFileMd5(fileMd5);
+        long multimodalCount = multimodalVectorizationService.countByFileMd5(fileMd5);
 
         if (existingFile.isEmpty()) {
             return false;
@@ -160,12 +182,12 @@ public class BootstrapKnowledgeInitializer implements CommandLineRunner {
                 && fileUpload.getStatus() == 1;
 
         boolean pageMetadataReady = !fileName.toLowerCase().endsWith(".pdf") || pageAwareVectorCount > 0;
-        if (metadataMatches && vectorCount > 0 && esCount > 0 && pageMetadataReady && fileRecordCount == 1) {
+        if (metadataMatches && vectorCount > 0 && multimodalCount > 0 && pageMetadataReady && fileRecordCount == 1) {
             return true;
         }
 
-        logger.info("启动知识库文档数据不完整、元数据已变化或存在重复记录，准备重新导入: fileMd5={}, fileRecords={}, vectors={}, pageAwareVectors={}, esDocs={}",
-                fileMd5, fileRecordCount, vectorCount, pageAwareVectorCount, esCount);
+        logger.info("启动知识库文档数据不完整、元数据已变化或存在重复记录，准备重新导入: fileMd5={}, fileRecords={}, vectors={}, pageAwareVectors={}, multimodalDocs={}",
+                fileMd5, fileRecordCount, vectorCount, pageAwareVectorCount, multimodalCount);
         return false;
     }
 
@@ -183,7 +205,15 @@ public class BootstrapKnowledgeInitializer implements CommandLineRunner {
         }
 
         try {
-            vectorizationService.vectorize(fileMd5, ownerUserId, bootstrapOrgTag, bootstrapPublic, bootstrapUserId);
+            MultimodalVectorizationService.MultimodalVectorizationResult vectorizationResult =
+                    multimodalVectorizationService.indexFile(
+                            fileMd5,
+                            fileName,
+                            ownerUserId,
+                            bootstrapOrgTag,
+                            bootstrapPublic,
+                            bootstrapUserId
+                    );
 
             FileUpload fileUpload = fileUploadRepository.findFirstByFileMd5AndUserIdOrderByCreatedAtDesc(fileMd5, ownerUserId)
                     .orElseGet(FileUpload::new);
@@ -195,6 +225,9 @@ public class BootstrapKnowledgeInitializer implements CommandLineRunner {
             fileUpload.setOrgTag(bootstrapOrgTag);
             fileUpload.setPublic(bootstrapPublic);
             fileUpload.setMergedAt(LocalDateTime.now());
+            fileUpload.setVectorizationStatus(FileUpload.VECTORIZATION_STATUS_COMPLETED);
+            fileUpload.setActualEmbeddingTokens((long) vectorizationResult.actualEmbeddingTokens());
+            fileUpload.setActualChunkCount(vectorizationResult.actualItemCount());
             fileUploadRepository.save(fileUpload);
 
             logger.info("启动知识库文档导入完成: fileName={}, fileMd5={}", fileName, fileMd5);
@@ -241,6 +274,12 @@ public class BootstrapKnowledgeInitializer implements CommandLineRunner {
             elasticsearchService.deleteByFileMd5(fileMd5);
         } catch (Exception e) {
             logger.warn("清理启动知识库 ES 数据失败: fileMd5={}, error={}", fileMd5, e.getMessage());
+        }
+
+        try {
+            multimodalVectorizationService.deleteByFileMd5(fileMd5);
+        } catch (Exception e) {
+            logger.warn("清理启动知识库多模态数据失败: fileMd5={}, error={}", fileMd5, e.getMessage());
         }
 
         try {

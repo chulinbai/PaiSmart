@@ -24,6 +24,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Base64;
 import java.util.stream.Collectors;
 
 /**
@@ -47,6 +48,8 @@ public class DocumentController {
 
     @Autowired
     private ChatHandler chatHandler;
+    @Autowired
+    private com.yizhaoqi.smartpai.service.knowledge.KnowledgeAccessService knowledgeAccess;
 
     /**
      * 删除文档及其相关数据
@@ -119,7 +122,9 @@ public class DocumentController {
         try {
             LogUtils.logBusiness("REINDEX_DOCUMENT", userId, "接收到重建文档索引请求: fileMd5=%s, role=%s", fileMd5, role);
 
-            Optional<FileUpload> fileOpt = fileUploadRepository.findFirstByFileMd5OrderByCreatedAtDesc(fileMd5);
+            Optional<FileUpload> fileOpt = fileUploadRepository
+                    .findFirstByFileMd5AndUserIdOrderByCreatedAtDesc(fileMd5, userId)
+                    .or(() -> fileUploadRepository.findFirstByFileMd5OrderByCreatedAtDesc(fileMd5));
             if (fileOpt.isEmpty()) {
                 monitor.end("重建失败：文档不存在");
                 Map<String, Object> response = new HashMap<>();
@@ -137,21 +142,25 @@ public class DocumentController {
                 return ResponseEntity.status(HttpStatus.FORBIDDEN).body(response);
             }
 
-            var result = documentService.reindexDocument(fileMd5, userId);
-            monitor.end("文档索引重建成功");
+            var result = documentService.reindexDocument(fileMd5, file.getUserId());
+            boolean queued = "knowledge:queued".equals(result.modelVersion());
+            String message = queued ? "索引重建任务已提交，请查看各索引状态" : "文档索引重建成功";
+            int status = queued ? HttpStatus.ACCEPTED.value() : HttpStatus.OK.value();
+            monitor.end(message);
 
             Map<String, Object> data = new HashMap<>();
             data.put("fileMd5", fileMd5);
             data.put("fileName", file.getFileName());
-            data.put("actualEmbeddingTokens", result.actualEmbeddingTokens());
-            data.put("actualChunkCount", result.actualChunkCount());
+            data.put("actualEmbeddingTokens", queued ? null : result.actualEmbeddingTokens());
+            data.put("actualChunkCount", queued ? null : result.actualChunkCount());
             data.put("modelVersion", result.modelVersion());
+            data.put("status", queued ? "QUEUED" : "COMPLETED");
 
             Map<String, Object> response = new HashMap<>();
-            response.put("code", 200);
-            response.put("message", "文档索引重建成功");
+            response.put("code", status);
+            response.put("message", message);
             response.put("data", data);
-            return ResponseEntity.ok(response);
+            return ResponseEntity.status(status).body(response);
         } catch (Exception e) {
             LogUtils.logBusinessError("REINDEX_DOCUMENT", userId, "重建文档索引失败: fileMd5=%s", e, fileMd5);
             monitor.end("重建失败: " + e.getMessage());
@@ -683,6 +692,88 @@ public class DocumentController {
         }
     }
 
+    @GetMapping("/embedded-image-preview")
+    public ResponseEntity<?> previewEmbeddedPdfImage(
+            @RequestParam String fileMd5,
+            @RequestParam Integer pageNumber,
+            @RequestParam Integer imageSequence,
+            @RequestHeader(value = "Authorization", required = false) String authorization,
+            @RequestParam(required = false) String token) {
+
+        LogUtils.PerformanceMonitor monitor = LogUtils.startPerformanceMonitor("PREVIEW_EMBEDDED_PDF_IMAGE");
+        try {
+            RequestAuthContext authContext = resolveRequestAuthContext(authorization, token);
+            String userId = authContext.userId();
+            String orgTags = authContext.orgTags();
+
+            FileUpload file;
+            if (userId == null) {
+                file = fileUploadRepository.findFirstByFileMd5AndIsPublicTrueOrderByCreatedAtDesc(fileMd5)
+                        .orElse(null);
+            } else {
+                file = documentService.getAccessibleFiles(userId, orgTags).stream()
+                        .filter(item -> item.getFileMd5().equals(fileMd5))
+                        .findFirst()
+                        .orElse(null);
+            }
+
+            if (file == null) {
+                monitor.end("预览失败：文件不存在或无权限访问");
+                return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of(
+                        "code", HttpStatus.NOT_FOUND.value(),
+                        "message", "文件不存在或无权限访问"
+                ));
+            }
+
+            if (!"pdf".equalsIgnoreCase(getFileExtension(file.getFileName()))) {
+                monitor.end("预览失败：仅支持 PDF 内嵌图片预览");
+                return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(Map.of(
+                        "code", HttpStatus.BAD_REQUEST.value(),
+                        "message", "仅支持 PDF 内嵌图片预览"
+                ));
+            }
+
+            DocumentService.PdfEmbeddedImagePreview preview = documentService.getPdfEmbeddedImagePreview(
+                    fileMd5,
+                    pageNumber,
+                    imageSequence
+            );
+            String dataUrl = "data:" + preview.contentType() + ";base64,"
+                    + Base64.getEncoder().encodeToString(preview.content());
+
+            Map<String, Object> data = new HashMap<>();
+            data.put("fileName", file.getFileName());
+            data.put("fileMd5", file.getFileMd5());
+            data.put("previewType", "image");
+            data.put("previewUrl", dataUrl);
+            data.put("sourcePageNumber", pageNumber);
+            data.put("imageSequence", imageSequence);
+            data.put("contentType", preview.contentType());
+
+            monitor.end("PDF 内嵌图片预览生成成功");
+            return ResponseEntity.ok(Map.of(
+                    "code", 200,
+                    "message", "PDF 内嵌图片预览获取成功",
+                    "data", data
+            ));
+        } catch (IllegalArgumentException e) {
+            monitor.end("预览失败: " + e.getMessage());
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(Map.of(
+                    "code", HttpStatus.BAD_REQUEST.value(),
+                    "message", e.getMessage()
+            ));
+        } catch (Exception e) {
+            LogUtils.logBusinessError("PREVIEW_EMBEDDED_PDF_IMAGE", "system",
+                    "PDF 内嵌图片预览失败: fileMd5=%s, pageNumber=%s, imageSequence=%s",
+                    e, fileMd5, pageNumber, imageSequence);
+            monitor.end("预览失败: " + e.getMessage());
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of(
+                    "code", HttpStatus.INTERNAL_SERVER_ERROR.value(),
+                    "message", "PDF 内嵌图片预览失败: " + e.getMessage()
+            ));
+        }
+    }
+
     @GetMapping("/download-by-md5")
     public ResponseEntity<?> downloadFileByMd5(
             @RequestParam String fileMd5,
@@ -771,9 +862,13 @@ public class DocumentController {
             }
 
             RequestAuthContext authContext = resolveRequestAuthContext(authorization, null);
-            if (authContext.userId() != null) {
-                boolean hasAccess = documentService.getAccessibleFiles(authContext.userId(), authContext.orgTags()).stream()
-                        .anyMatch(file -> file.getFileMd5().equals(detail.fileMd5()));
+            {
+                boolean hasAccess=false;
+                if(authContext.userId()!=null) {
+                    var identity=knowledgeAccess.resolve(authContext.userId());
+                    hasAccess=knowledgeAccess.documents(identity,java.util.List.of()).stream()
+                        .anyMatch(file->detail.documentId()!=null?file.getId().equals(detail.documentId()):file.getFileMd5().equals(detail.fileMd5()));
+                }
                 if (!hasAccess) {
                     monitor.end("获取引用详情失败：无权限访问引用文件");
                     Map<String, Object> response = new HashMap<>();
@@ -796,6 +891,20 @@ public class DocumentController {
             data.put("evidenceSnippet", detail.evidenceSnippet());
             data.put("score", detail.score());
             data.put("chunkId", detail.chunkId());
+            data.put("itemId", detail.itemId());
+            data.put("knowledgeType", detail.knowledgeType());
+            data.put("searchText", detail.searchText());
+            data.put("imageText", detail.imageText());
+            data.put("imageSourceType", detail.imageSourceType());
+            data.put("imageUrl", detail.imageUrl());
+            data.put("bucketName", detail.bucketName());
+            data.put("objectName", detail.objectName());
+            data.put("embeddedImageId", detail.embeddedImageId());
+            data.put("imageSequence", detail.imageSequence());
+            data.put("contentType", detail.contentType());
+            data.put("width", detail.width());
+            data.put("height", detail.height());
+            data.put("sourceId",detail.sourceId());data.put("documentId",detail.documentId());data.put("chunkSetId",detail.chunkSetId());
 
             Map<String, Object> response = new HashMap<>();
             response.put("code", 200);
@@ -840,7 +949,8 @@ public class DocumentController {
         }
 
         if (preferSinglePagePreview && "pdf".equals(previewType) && pageNumber != null && pageNumber > 0) {
-            payload.put("previewUrl", buildSinglePagePreviewUrl(file.getFileMd5(), pageNumber));
+            // 直接预览原始 PDF，避免 PDFBox 重组单页时丢失继承字体/资源导致中文缺字。
+            payload.put("previewUrl", previewUrl);
             payload.put("sourceUrl", previewUrl);
             payload.put("singlePageMode", true);
             payload.put("sourcePageNumber", pageNumber);

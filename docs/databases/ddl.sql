@@ -65,6 +65,45 @@ CREATE TABLE document_vectors (
                                   is_public BOOLEAN NOT NULL DEFAULT FALSE COMMENT '文件是否公开'
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='文档向量存储表';
 
+CREATE TABLE knowledge_multimodal_items (
+                                            id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '多模态知识项主键',
+                                            item_id VARCHAR(128) NOT NULL COMMENT '多模态知识项唯一ID，与ES文档ID一致',
+                                            file_md5 VARCHAR(32) NOT NULL COMMENT '来源文件MD5',
+                                            file_name VARCHAR(512) DEFAULT NULL COMMENT '来源文件名',
+                                            knowledge_type VARCHAR(32) NOT NULL COMMENT '知识类型：TEXT_CHUNK / DOCUMENT_IMAGE / STANDALONE_IMAGE',
+                                            search_text LONGTEXT COMMENT '统一检索文本，文本块为正文，图片为图片说明和上下文',
+                                            model_version VARCHAR(256) DEFAULT NULL COMMENT '生成向量的多模态模型版本',
+                                            user_id VARCHAR(64) NOT NULL COMMENT '上传用户ID',
+                                            org_tag VARCHAR(50) DEFAULT NULL COMMENT '组织标签',
+                                            is_public BOOLEAN NOT NULL DEFAULT FALSE COMMENT '是否公开',
+                                            chunk_id INT DEFAULT NULL COMMENT '文本切片序号，仅TEXT_CHUNK使用',
+                                            page_number INT DEFAULT NULL COMMENT 'PDF页码，PDF文本和PDF内嵌图片使用',
+                                            anchor_text VARCHAR(512) DEFAULT NULL COMMENT '页内定位锚点，仅文本切片使用',
+                                            text_content LONGTEXT COMMENT '文本切片内容，仅TEXT_CHUNK使用',
+                                            image_text LONGTEXT COMMENT '图片联合embedding时使用的文字上下文',
+                                            image_source_type VARCHAR(32) DEFAULT NULL COMMENT '图片来源：MINIO_OBJECT / DOCUMENT_EMBEDDED',
+                                            image_url VARCHAR(2048) DEFAULT NULL COMMENT '独立图片的MinIO可访问URL或回显URL',
+                                            bucket_name VARCHAR(128) DEFAULT NULL COMMENT '独立图片所在MinIO bucket',
+                                            object_name VARCHAR(1024) DEFAULT NULL COMMENT '独立图片所在MinIO objectName',
+                                            embedded_image_id VARCHAR(160) DEFAULT NULL COMMENT 'PDF内嵌图片定位ID，不落MinIO',
+                                            image_sequence INT DEFAULT NULL COMMENT '图片在PDF当前页内的序号',
+                                            content_type VARCHAR(128) DEFAULT NULL COMMENT '图片MIME类型',
+                                            width INT DEFAULT NULL COMMENT '图片宽度',
+                                            height INT DEFAULT NULL COMMENT '图片高度',
+                                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+                                            UNIQUE KEY uk_kmi_item_id (item_id),
+                                            INDEX idx_kmi_file_md5 (file_md5),
+                                            INDEX idx_kmi_knowledge_type (knowledge_type),
+                                            INDEX idx_kmi_owner (user_id),
+                                            INDEX idx_kmi_org_tag (org_tag)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='多模态知识项元数据表';
+
+-- Existing deployments that created this table before the LONGTEXT change can run this safely.
+ALTER TABLE knowledge_multimodal_items MODIFY COLUMN search_text LONGTEXT COMMENT '统一检索文本，文本块为正文，图片为图片说明和上下文';
+ALTER TABLE knowledge_multimodal_items MODIFY COLUMN text_content LONGTEXT COMMENT '文本切片内容，仅TEXT_CHUNK使用';
+ALTER TABLE knowledge_multimodal_items MODIFY COLUMN image_text LONGTEXT COMMENT '图片联合embedding时使用的文字上下文';
+
 CREATE TABLE rate_limit_configs (
                                     config_key VARCHAR(64) PRIMARY KEY COMMENT '限流配置键',
                                     single_max INT DEFAULT NULL COMMENT '单窗口最大次数',

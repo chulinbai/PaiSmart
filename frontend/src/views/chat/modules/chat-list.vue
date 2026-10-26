@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { NScrollbar } from 'naive-ui';
+import { normalizeHistoryMessage } from '@/utils/chat-generation';
 import { VueMarkdownItProvider } from '@/vendor/vue-markdown-shiki';
 import ChatMessage from './chat-message.vue';
 
@@ -59,7 +60,7 @@ async function getList() {
     params: params.value
   });
   if (!error) {
-    list.value = data;
+    list.value = (data || []).map(normalizeHistoryMessage);
   }
   loading.value = false;
 }

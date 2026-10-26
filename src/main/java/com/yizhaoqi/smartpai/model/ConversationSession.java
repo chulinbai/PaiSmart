@@ -12,6 +12,7 @@ import java.time.LocalDateTime;
 @Table(name = "conversation_sessions", indexes = {
         @Index(name = "idx_cs_user_id", columnList = "user_id"),
         @Index(name = "idx_cs_conversation_id", columnList = "conversation_id", unique = true),
+        @Index(name = "idx_cs_workspace_id", columnList = "workspace_id"),
         @Index(name = "idx_cs_status", columnList = "status")
 })
 public class ConversationSession {
@@ -26,6 +27,9 @@ public class ConversationSession {
 
     @Column(name = "conversation_id", length = 64, nullable = false, unique = true)
     private String conversationId;
+
+    @Column(name = "workspace_id", length = 36)
+    private String workspaceId;
 
     @Column(length = 255)
     private String title;

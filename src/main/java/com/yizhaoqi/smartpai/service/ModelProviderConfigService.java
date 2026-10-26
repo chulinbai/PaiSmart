@@ -25,6 +25,8 @@ import java.util.Optional;
 @Service
 public class ModelProviderConfigService {
 
+    public static final int DEFAULT_CONTEXT_WINDOW_TOKENS = 32768;
+
     public static final String SCOPE_LLM = "llm";
     public static final String SCOPE_EMBEDDING = "embedding";
     public static final String API_STYLE_OPENAI = "openai-compatible";
@@ -44,13 +46,13 @@ public class ModelProviderConfigService {
     @Value("${deepseek.api.model:deepseek-chat}")
     private String deepSeekModel;
 
-    @Value("${embedding.api.url:https://dashscope.aliyuncs.com/compatible-mode/v1}")
+    @Value("${embedding.api.url:http://127.0.0.1:11435/v1/embeddings}")
     private String embeddingApiUrl;
 
     @Value("${embedding.api.key:}")
     private String embeddingApiKey;
 
-    @Value("${embedding.api.model:text-embedding-v4}")
+    @Value("${embedding.api.model:MedAIBase/Qwen3-VL-Embedding:2b}")
     private String embeddingModel;
 
     @Value("${embedding.api.dimension:2048}")
@@ -119,6 +121,9 @@ public class ModelProviderConfigService {
             entity.setModelName(requireNonBlank(item.model(), fallback.model(), provider + " 模型不能为空"));
             entity.setEmbeddingDimension(SCOPE_EMBEDDING.equals(normalizedScope)
                     ? Optional.ofNullable(item.dimension()).orElse(fallback.dimension())
+                    : null);
+            entity.setContextWindowTokens(SCOPE_LLM.equals(normalizedScope)
+                    ? Optional.ofNullable(item.contextWindowTokens()).orElse(fallback.contextWindowTokens())
                     : null);
             entity.setEnabled(item.enabled() == null ? fallback.enabled() : item.enabled());
             entity.setActive(provider.equals(request.activeProvider()));
@@ -202,17 +207,16 @@ public class ModelProviderConfigService {
                 SCOPE_LLM,
                 "deepseek",
                 List.of(
-                        new ProviderConfigView("deepseek", "DeepSeek", API_STYLE_OPENAI, deepSeekApiUrl, deepSeekModel, null, true, true, hasValue(deepSeekApiKey), secretCryptoService.mask(deepSeekApiKey)),
-                        new ProviderConfigView("qwen", "Qwen", API_STYLE_OPENAI, "https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen-flash", null, true, false, false, ""),
-                        new ProviderConfigView("zhipu", "ZhipuAI", API_STYLE_OPENAI, "https://open.bigmodel.cn/api/paas/v4", "glm-4.5-air", null, true, false, false, "")
+                        new ProviderConfigView("deepseek", "DeepSeek", API_STYLE_OPENAI, deepSeekApiUrl, deepSeekModel, null, DEFAULT_CONTEXT_WINDOW_TOKENS, true, true, hasValue(deepSeekApiKey), secretCryptoService.mask(deepSeekApiKey)),
+                        new ProviderConfigView("qwen", "Qwen", API_STYLE_OPENAI, "https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen-flash", null, DEFAULT_CONTEXT_WINDOW_TOKENS, true, false, false, ""),
+                        new ProviderConfigView("zhipu", "ZhipuAI", API_STYLE_OPENAI, "https://open.bigmodel.cn/api/paas/v4", "glm-4.5-air", null, DEFAULT_CONTEXT_WINDOW_TOKENS, true, false, false, "")
                 )
         );
         ScopeSettingsView embedding = new ScopeSettingsView(
                 SCOPE_EMBEDDING,
                 "aliyun",
                 List.of(
-                        new ProviderConfigView("aliyun", "阿里云", API_STYLE_OPENAI, embeddingApiUrl, embeddingModel, embeddingDimension, true, true, hasValue(embeddingApiKey), secretCryptoService.mask(embeddingApiKey)),
-                        new ProviderConfigView("zhipu", "智谱AI", API_STYLE_OPENAI, "https://open.bigmodel.cn/api/paas/v4", "embedding-3", 2048, true, false, false, "")
+                        new ProviderConfigView("aliyun", "Qwen3-VL 多模态", API_STYLE_OPENAI, embeddingApiUrl, embeddingModel, embeddingDimension, null, true, true, hasValue(embeddingApiKey), secretCryptoService.mask(embeddingApiKey))
                 )
         );
         return new ModelProviderSettingsView(llm, embedding);
@@ -246,6 +250,7 @@ public class ModelProviderConfigService {
                     normalizeOpenAiCompatibleBaseUrl(config.getApiBaseUrl()),
                     config.getModelName(),
                     config.getEmbeddingDimension() != null ? config.getEmbeddingDimension() : fallback.dimension(),
+                    config.getContextWindowTokens() != null ? config.getContextWindowTokens() : fallback.contextWindowTokens(),
                     config.isEnabled(),
                     config.isActive(),
                     hasValue(decryptedApiKey),
@@ -280,7 +285,8 @@ public class ModelProviderConfigService {
                 normalizeOpenAiCompatibleBaseUrl(provider.apiBaseUrl()),
                 provider.model(),
                 apiKey,
-                provider.dimension()
+                provider.dimension(),
+                provider.contextWindowTokens() != null ? provider.contextWindowTokens() : DEFAULT_CONTEXT_WINDOW_TOKENS
         );
     }
 
@@ -546,6 +552,7 @@ public class ModelProviderConfigService {
             String apiBaseUrl,
             String model,
             Integer dimension,
+            Integer contextWindowTokens,
             boolean enabled,
             boolean active,
             boolean hasApiKey,
@@ -559,8 +566,13 @@ public class ModelProviderConfigService {
             String model,
             String apiKey,
             Integer dimension,
+            Integer contextWindowTokens,
             Boolean enabled
     ) {
+        public ProviderUpsertRequest(String provider, String apiBaseUrl, String model, String apiKey,
+                                     Integer dimension, Boolean enabled) {
+            this(provider, apiBaseUrl, model, apiKey, dimension, null, enabled);
+        }
     }
 
     public record UpdateScopeRequest(
@@ -574,8 +586,13 @@ public class ModelProviderConfigService {
             String apiBaseUrl,
             String model,
             String apiKey,
-            Integer dimension
+            Integer dimension,
+            Integer contextWindowTokens
     ) {
+        public ProviderConnectionTestRequest(String provider, String apiBaseUrl, String model,
+                                             String apiKey, Integer dimension) {
+            this(provider, apiBaseUrl, model, apiKey, dimension, null);
+        }
     }
 
     public record ConnectivityTestView(
@@ -592,7 +609,8 @@ public class ModelProviderConfigService {
             String apiBaseUrl,
             String model,
             String apiKey,
-            Integer dimension
+            Integer dimension,
+            Integer contextWindowTokens
     ) {
     }
 }

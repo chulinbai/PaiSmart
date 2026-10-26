@@ -1,6 +1,23 @@
 server:
   port: ${SERVER_PORT:8081}
 
+# 压测监控端点使用独立端口，避免占用业务端口的连接和线程。
+management:
+  server:
+    port: ${MANAGEMENT_SERVER_PORT:8082}
+    # 本地 Prometheus 需要访问管理端口；生产环境建议配合防火墙或反向代理限制来源。
+    address: ${MANAGEMENT_SERVER_ADDRESS:0.0.0.0}
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: when_authorized
+  metrics:
+    tags:
+      application: paismart
+
 spring:
   # dev 用于本地源码启动，优先读取 `.env` 中的同名变量。
   jackson:
@@ -44,9 +61,11 @@ spring:
     consumer:
       group-id: file-processing-group
       auto-offset-reset: earliest
+      max-poll-records: 1
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
       value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
       properties:
+        max.poll.interval.ms: ${SPRING_KAFKA_CONSUMER_MAX_POLL_INTERVAL_MS:3600000}
         spring.json.trusted.packages: "*"
         client.dns.lookup: use_all_dns_ips
     topic:
@@ -150,6 +169,7 @@ elasticsearch:
   username: ${ELASTICSEARCH_USERNAME:elastic}
   password: ${ELASTICSEARCH_PASSWORD:}
   insecure-trust-all-certificates: ${ELASTICSEARCH_INSECURE_TRUST_ALL_CERTIFICATES:true}
+  bulk-size: ${ELASTICSEARCH_BULK_SIZE:500}
 
 security:
   # 前端调试域名白名单，支持 Origin pattern
@@ -171,8 +191,27 @@ deepseek:
 
 embedding:
   api:
-    url: ${EMBEDDING_API_URL:https://dashscope.aliyuncs.com/compatible-mode/v1}
+    url: ${EMBEDDING_API_URL:http://127.0.0.1:11435/v1/embeddings}
     key: ${EMBEDDING_API_KEY:}
-    model: ${EMBEDDING_API_MODEL:text-embedding-v4}
+    model: ${EMBEDDING_API_MODEL:MedAIBase/Qwen3-VL-Embedding:2b}
     batch-size: ${EMBEDDING_BATCH_SIZE:10}
+    local-batch-size: ${EMBEDDING_LOCAL_BATCH_SIZE:1}
+    local-delay-ms: ${EMBEDDING_LOCAL_DELAY_MS:75}
+    request-timeout-seconds: ${EMBEDDING_REQUEST_TIMEOUT_SECONDS:60}
     dimension: ${EMBEDDING_DIMENSION:2048}
+
+multimodal:
+  elasticsearch:
+    index-name: ${MULTIMODAL_ES_INDEX_NAME:knowledge_multimodal}
+  embedding:
+    api:
+      url: ${MULTIMODAL_EMBEDDING_API_URL:http://127.0.0.1:11435/v1/embeddings}
+      key: ${MULTIMODAL_EMBEDDING_API_KEY:}
+      model: ${MULTIMODAL_EMBEDDING_API_MODEL:MedAIBase/Qwen3-VL-Embedding:2b}
+      dimension: ${MULTIMODAL_EMBEDDING_DIMENSION:2048}
+      batch-size: ${MULTIMODAL_EMBEDDING_BATCH_SIZE:4}
+      request-timeout-seconds: ${MULTIMODAL_EMBEDDING_REQUEST_TIMEOUT_SECONDS:300}
+      max-in-memory-mb: ${MULTIMODAL_EMBEDDING_MAX_IN_MEMORY_MB:128}
+  pdf-image:
+    max-images-per-file: ${MULTIMODAL_PDF_IMAGE_MAX_IMAGES_PER_FILE:200}
+    context-max-chars: ${MULTIMODAL_PDF_IMAGE_CONTEXT_MAX_CHARS:1200}

@@ -10,6 +10,7 @@ import java.util.List;
 
 @Repository
 public interface ConversationRepository extends JpaRepository<Conversation, Long> {
+    java.util.Optional<Conversation> findByGenerationId(String generationId);
 
     /**
      * 根据用户 ID 和时间范围查询对话记录。

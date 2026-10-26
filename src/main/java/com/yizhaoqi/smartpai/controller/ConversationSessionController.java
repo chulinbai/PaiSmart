@@ -72,6 +72,29 @@ public class ConversationSessionController {
         }
     }
 
+    @PostMapping("/{conversationId}/copy")
+    public ResponseEntity<?> copySession(
+            @RequestHeader("Authorization") String token,
+            @PathVariable String conversationId) {
+        String username = null;
+        try {
+            username = jwtUtils.extractUsernameFromToken(token.replace("Bearer ", ""));
+            if (username == null || username.isEmpty()) {
+                throw new CustomException("无效的token", HttpStatus.UNAUTHORIZED);
+            }
+
+            Long userId = Long.parseLong(jwtUtils.extractUserIdFromToken(token.replace("Bearer ", "")));
+            Map<String, Object> copied = conversationService.copyConversationSession(userId, conversationId);
+            return ResponseEntity.ok(Map.of("code", 200, "message", "复制对话成功", "data", copied));
+        } catch (CustomException e) {
+            return ResponseEntity.status(e.getStatus()).body(Map.of("code", e.getStatus().value(), "message", e.getMessage()));
+        } catch (Exception e) {
+            LogUtils.logBusinessError("COPY_SESSION", username, "复制对话异常: %s", e, e.getMessage());
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(Map.of("code", 500, "message", "服务器内部错误: " + e.getMessage()));
+        }
+    }
+
     @PutMapping("/{conversationId}/archive")
     public ResponseEntity<?> archiveSession(
             @RequestHeader("Authorization") String token,

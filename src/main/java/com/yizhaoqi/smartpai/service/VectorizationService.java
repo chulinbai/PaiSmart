@@ -8,14 +8,15 @@ import com.yizhaoqi.smartpai.repository.DocumentVectorRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.stereotype.Service;
 
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.stream.IntStream;
 
 // 向量化服务类
-@Service
 public class VectorizationService {
 
     private static final Logger logger = LoggerFactory.getLogger(VectorizationService.class);
@@ -50,9 +51,23 @@ public class VectorizationService {
                        fileMd5, userId, orgTag, isPublic);
                        
             // 获取文件分块内容
-            List<TextChunk> chunks = fetchTextChunks(fileMd5);
-            if (chunks == null || chunks.isEmpty()) {
+            List<TextChunk> rawChunks = fetchTextChunks(fileMd5);
+            if (rawChunks == null || rawChunks.isEmpty()) {
                 logger.warn("未找到分块内容，fileMd5: {}", fileMd5);
+                return new VectorizationUsageResult(0, 0, embeddingClient.currentModelVersion());
+            }
+
+            List<TextChunk> chunks = rawChunks.stream()
+                    .filter(chunk -> chunk.getContent() != null && !chunk.getContent().isBlank())
+                    .toList();
+            int skippedChunks = rawChunks.size() - chunks.size();
+            if (skippedChunks > 0) {
+                logger.warn("向量化前跳过空白切片: fileMd5={}, skipped={}, total={}",
+                        fileMd5, skippedChunks, rawChunks.size());
+            }
+            chunks = deduplicateChunksByChunkId(chunks, fileMd5);
+            if (chunks.isEmpty()) {
+                logger.warn("文件没有可向量化的有效文本切片，fileMd5: {}", fileMd5);
                 return new VectorizationUsageResult(0, 0, embeddingClient.currentModelVersion());
             }
 
@@ -68,16 +83,23 @@ public class VectorizationService {
                     EmbeddingClient.UsageType.UPLOAD
             );
             List<float[]> vectors = embeddingResult.vectors();
+            if (vectors.size() != chunks.size()) {
+                throw new RuntimeException(String.format(
+                        "Embedding 返回数量不匹配: fileMd5=%s, chunks=%d, vectors=%d",
+                        fileMd5, chunks.size(), vectors.size()
+                ));
+            }
 
             // 构建 Elasticsearch 文档并存储
-            List<EsDocument> esDocuments = IntStream.range(0, chunks.size())
+            List<TextChunk> chunksForIndex = chunks;
+            List<EsDocument> esDocuments = IntStream.range(0, chunksForIndex.size())
                     .mapToObj(i -> new EsDocument(
                             UUID.randomUUID().toString(),
                             fileMd5,
-                            chunks.get(i).getChunkId(),
-                            chunks.get(i).getContent(),
-                            chunks.get(i).getPageNumber(),
-                            chunks.get(i).getAnchorText(),
+                            chunksForIndex.get(i).getChunkId(),
+                            chunksForIndex.get(i).getContent(),
+                            chunksForIndex.get(i).getPageNumber(),
+                            chunksForIndex.get(i).getAnchorText(),
                             vectors.get(i),
                             embeddingResult.modelVersion(),
                             userId,
@@ -104,6 +126,21 @@ public class VectorizationService {
         }
     }
     
+    private List<TextChunk> deduplicateChunksByChunkId(List<TextChunk> chunks, String fileMd5) {
+        Map<Integer, TextChunk> uniqueChunks = new LinkedHashMap<>();
+        int duplicateCount = 0;
+        for (TextChunk chunk : chunks) {
+            TextChunk previous = uniqueChunks.putIfAbsent(chunk.getChunkId(), chunk);
+            if (previous != null) {
+                duplicateCount++;
+            }
+        }
+        if (duplicateCount > 0) {
+            logger.warn("向量化前跳过重复切片: fileMd5={}, duplicate={}, before={}, after={}",
+                    fileMd5, duplicateCount, chunks.size(), uniqueChunks.size());
+        }
+        return new ArrayList<>(uniqueChunks.values());
+    }
 
     /**
      * 获取文件分块内容

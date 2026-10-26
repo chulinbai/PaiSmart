@@ -11,8 +11,10 @@ import com.yizhaoqi.smartpai.entity.EsDocument;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
+import java.util.ArrayList;
 import java.util.List;
 
 // Elasticsearch操作封装服务
@@ -24,6 +26,9 @@ public class ElasticsearchService {
     @Autowired
     private ElasticsearchClient esClient;
 
+    @Value("${elasticsearch.bulk-size:500}")
+    private int bulkSize;
+
     /**
      * 批量索引文档到Elasticsearch中
      * 通过接收一个EsDocument对象列表，将这些文档批量索引到名为"knowledge_base"的索引中
@@ -33,40 +38,59 @@ public class ElasticsearchService {
      */
     public void bulkIndex(List<EsDocument> documents) {
         try {
-            logger.info("开始批量索引文档到Elasticsearch，文档数量: {}", documents.size());
-            
-            // 将文档列表转换为批量操作列表，每个文档都对应一个索引操作
-            List<BulkOperation> bulkOperations = documents.stream()
-                    .map(doc -> BulkOperation.of(op -> op.index(idx -> idx
-                            .index("knowledge_base") // 指定索引名称
-                            .id(doc.getId()) // 使用文档的ID作为Elasticsearch中的文档ID
-                            .document(doc) // 将文档对象作为数据源
-                    )))
-                    .toList();
-
-            // 创建BulkRequest对象，并将批量操作列表添加到请求中
-            BulkRequest request = BulkRequest.of(b -> b.operations(bulkOperations));
-            
-            // 执行批量索引操作
-            BulkResponse response = esClient.bulk(request);
-            
-            // 检查响应结果
-            if (response.errors()) {
-                logger.error("批量索引过程中发生错误:");
-                for (BulkResponseItem item : response.items()) {
-                    if (item.error() != null) {
-                        logger.error("文档索引失败 - ID: {}, 错误: {}", item.id(), item.error().reason());
-                    }
-                }
-                throw new RuntimeException("批量索引部分失败，请检查日志");
-            } else {
-                logger.info("批量索引成功完成，文档数量: {}", documents.size());
+            if (documents == null || documents.isEmpty()) {
+                logger.info("没有需要索引到 Elasticsearch 的文档");
+                return;
             }
+
+            int effectiveBulkSize = Math.max(1, bulkSize);
+            logger.info("开始批量索引文档到Elasticsearch，文档数量: {}, bulkSize: {}", documents.size(), effectiveBulkSize);
+
+            int indexedCount = 0;
+            for (int start = 0; start < documents.size(); start += effectiveBulkSize) {
+                int end = Math.min(start + effectiveBulkSize, documents.size());
+                List<EsDocument> batch = documents.subList(start, end);
+                BulkResponse response = executeBulk(batch);
+                if (response.errors()) {
+                    logBulkErrors(response, start, end);
+                    throw new RuntimeException("批量索引部分失败，请检查日志");
+                }
+                indexedCount += batch.size();
+                logger.info("Elasticsearch bulk 索引批次完成: {}-{} / {}", start, end - 1, documents.size());
+            }
+
+            logger.info("批量索引成功完成，文档数量: {}", indexedCount);
         } catch (Exception e) {
-            logger.error("批量索引失败，文档数量: {}", documents.size(), e);
+            logger.error("批量索引失败，文档数量: {}", documents == null ? 0 : documents.size(), e);
             // 如果发生异常，抛出运行时异常，表明批量索引失败
             throw new RuntimeException("批量索引失败", e);
         }
+    }
+
+    private BulkResponse executeBulk(List<EsDocument> documents) throws Exception {
+        List<BulkOperation> bulkOperations = documents.stream()
+                .map(doc -> BulkOperation.of(op -> op.index(idx -> idx
+                        .index("knowledge_base")
+                        .id(doc.getId())
+                        .document(doc)
+                )))
+                .toList();
+
+        BulkRequest request = BulkRequest.of(b -> b.operations(bulkOperations));
+        return esClient.bulk(request);
+    }
+
+    private void logBulkErrors(BulkResponse response, int start, int end) {
+        List<BulkResponseItem> failedItems = new ArrayList<>();
+        for (BulkResponseItem item : response.items()) {
+            if (item.error() != null) {
+                failedItems.add(item);
+            }
+        }
+        logger.error("批量索引过程中发生错误: range={}-{}, failedCount={}", start, end - 1, failedItems.size());
+        failedItems.stream()
+                .limit(10)
+                .forEach(item -> logger.error("文档索引失败 - ID: {}, 错误: {}", item.id(), item.error().reason()));
     }
 
     /**
@@ -83,6 +107,13 @@ public class ElasticsearchService {
         } catch (Exception e) {
             throw new RuntimeException("删除文档失败", e);
         }
+    }
+    public void deleteByFileMd5AndUserId(String fileMd5,String userId) {
+        try {
+            esClient.deleteByQuery(d->d.index("knowledge_base").ignoreUnavailable(true).query(q->q.bool(b->b
+                .filter(f->f.term(t->t.field("fileMd5").value(fileMd5)))
+                .filter(f->f.term(t->t.field("userId").value(userId))))));
+        } catch(Exception error) { throw new IllegalStateException("删除指定上传者的旧索引失败",error); }
     }
 
     public long countByFileMd5(String fileMd5) {

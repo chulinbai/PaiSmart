@@ -14,6 +14,7 @@ function cloneProviderItem(item: Api.Admin.ModelProviderItem): Api.Admin.ModelPr
     apiBaseUrl: item.apiBaseUrl,
     model: item.model,
     dimension: item.dimension ?? null,
+    contextWindowTokens: item.contextWindowTokens ?? (item.dimension === null ? 32768 : null),
     enabled: Boolean(item.enabled),
     active: Boolean(item.active),
     hasApiKey: Boolean(item.hasApiKey),
@@ -61,6 +62,7 @@ function buildProviderPayload(scope: Api.Admin.ModelProviderScopeSettings) {
       model: item.model,
       apiKey: item.apiKeyInput?.trim() || '',
       dimension: scope.scope === 'embedding' ? item.dimension : null,
+      contextWindowTokens: scope.scope === 'llm' ? item.contextWindowTokens : null,
       enabled: item.enabled
     }))
   };
@@ -95,7 +97,8 @@ async function testModelProvider(scopeKey: 'llm' | 'embedding', provider: Api.Ad
       apiBaseUrl: provider.apiBaseUrl,
       model: provider.model,
       apiKey: provider.apiKeyInput?.trim() || '',
-      dimension: scopeKey === 'embedding' ? provider.dimension : null
+      dimension: scopeKey === 'embedding' ? provider.dimension : null,
+      contextWindowTokens: scopeKey === 'llm' ? provider.contextWindowTokens : null
     }
   });
 
@@ -164,6 +167,10 @@ onMounted(() => {
                   <div>
                     <div class="limit-label">模型</div>
                     <NInput v-model:value="item.model" />
+                  </div>
+                  <div>
+                    <div class="limit-label">上下文窗口</div>
+                    <NInputNumber v-model:value="item.contextWindowTokens" :min="4096" :step="1024" class="w-full" />
                   </div>
                   <div>
                     <div class="limit-label">现有密钥</div>

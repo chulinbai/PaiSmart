@@ -50,12 +50,16 @@ public class FileTypeValidationService {
             "keynote"       // Apple Keynote演示文稿
     ));
 
+    private static final Set<String> SUPPORTED_IMAGE_EXTENSIONS = new HashSet<>(Arrays.asList(
+            "jpg", "jpeg", "png", "gif", "bmp", "webp", "tif", "tiff"
+    ));
+
     /**
      * 不支持的文件类型扩展名（无法有效解析文本内容的文件类型）
      */
     private static final Set<String> UNSUPPORTED_EXTENSIONS = new HashSet<>(Arrays.asList(
-            // 图片文件
-            "jpg", "jpeg", "png", "gif", "bmp", "svg", "webp", "tiff", "ico", "psd",
+            // 图片文件（常见位图格式已由多模态 Embedding 支持，剩余格式仍不支持）
+            "svg", "ico", "psd",
             
             // 音频文件
             "mp3", "wav", "flac", "aac", "ogg", "wma", "m4a",
@@ -112,16 +116,21 @@ public class FileTypeValidationService {
             return new FileTypeValidationResult(true, "支持的文件类型", fileType, extension);
         }
 
+        if (SUPPORTED_IMAGE_EXTENSIONS.contains(extension)) {
+            logger.info("图片文件类型验证通过: fileName={}, extension={}, fileType={}", fileName, extension, fileType);
+            return new FileTypeValidationResult(true, "支持的图片类型", fileType, extension);
+        }
+
         // 检查是否为明确不支持的类型
         if (UNSUPPORTED_EXTENSIONS.contains(extension)) {
-            String message = String.format("不支持的文件类型：%s。系统仅支持文档类型文件的解析和向量化", fileType);
+            String message = String.format("不支持的文件类型：%s。系统支持文档类型文件和常见图片文件的解析与向量化", fileType);
             logger.warn("文件类型验证失败: fileName={}, extension={}, fileType={}, reason=unsupported_type", 
                       fileName, extension, fileType);
             return new FileTypeValidationResult(false, message, fileType, extension);
         }
 
         // 对于未知的文件类型，给出提示
-        String message = String.format("未知的文件类型：%s。建议使用支持的文档格式（如PDF、Word、Excel、PowerPoint、文本文件等）", fileType);
+        String message = String.format("未知的文件类型：%s。建议使用支持的文档格式（如PDF、Word、Excel、PowerPoint、文本文件等）或图片格式（如JPG、PNG、WebP等）", fileType);
         logger.warn("文件类型验证失败: fileName={}, extension={}, fileType={}, reason=unknown_type", 
                   fileName, extension, fileType);
         return new FileTypeValidationResult(false, message, fileType, extension);
@@ -208,6 +217,11 @@ public class FileTypeValidationService {
                 return "GIF图片";
             case "bmp":
                 return "BMP图片";
+            case "webp":
+                return "WebP图片";
+            case "tif":
+            case "tiff":
+                return "TIFF图片";
             case "svg":
                 return "SVG图片";
             case "mp4":
@@ -241,6 +255,9 @@ public class FileTypeValidationService {
         for (String extension : SUPPORTED_DOCUMENT_EXTENSIONS) {
             supportedTypes.add(getFileTypeDescription(extension));
         }
+        for (String extension : SUPPORTED_IMAGE_EXTENSIONS) {
+            supportedTypes.add(getFileTypeDescription(extension));
+        }
         return supportedTypes;
     }
 
@@ -250,7 +267,14 @@ public class FileTypeValidationService {
      * @return 支持的文件扩展名集合
      */
     public Set<String> getSupportedExtensions() {
-        return new HashSet<>(SUPPORTED_DOCUMENT_EXTENSIONS);
+        Set<String> supported = new HashSet<>(SUPPORTED_DOCUMENT_EXTENSIONS);
+        supported.addAll(SUPPORTED_IMAGE_EXTENSIONS);
+        return supported;
+    }
+
+    public boolean isSupportedImageFileName(String fileName) {
+        String extension = extractFileExtension(fileName);
+        return extension != null && SUPPORTED_IMAGE_EXTENSIONS.contains(extension);
     }
 
     /**
@@ -291,4 +315,4 @@ public class FileTypeValidationService {
                                valid, message, fileType, extension);
         }
     }
-} 
+}

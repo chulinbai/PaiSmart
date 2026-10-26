@@ -390,7 +390,8 @@ public class UploadController {
                     fileUpload.getOrgTag(),
                     fileUpload.isPublic(),
                     FileProcessingTask.TASK_TYPE_UPLOAD_PROCESS,
-                    userId
+                    userId,
+                    fileUpload.getId()
             );
 
             fileUpload.setVectorizationStatus(FileUpload.VECTORIZATION_STATUS_PROCESSING);
@@ -505,7 +506,7 @@ public class UploadController {
             Map<String, Object> data = new HashMap<>();
             data.put("supportedTypes", supportedTypes);
             data.put("supportedExtensions", supportedExtensions);
-            data.put("description", "系统支持的文档类型文件，这些文件可以被解析并进行向量化处理");
+            data.put("description", "系统支持文档和常见图片文件。文档会解析文本，图片会进入多模态向量化处理");
             
             // 构建统一响应格式
             Map<String, Object> response = new HashMap<>();
@@ -543,7 +544,6 @@ public class UploadController {
         if (lastDotIndex == -1 || lastDotIndex == fileName.length() - 1) {
             return "unknown";
         }
-        
         String extension = fileName.substring(lastDotIndex + 1).toLowerCase();
         
         // 根据文件扩展名返回文件类型
@@ -572,6 +572,11 @@ public class UploadController {
                 return "GIF图片";
             case "bmp":
                 return "BMP图片";
+            case "webp":
+                return "WebP图片";
+            case "tif":
+            case "tiff":
+                return "TIFF图片";
             case "svg":
                 return "SVG图片";
             case "mp4":

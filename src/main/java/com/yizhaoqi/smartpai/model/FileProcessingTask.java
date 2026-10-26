@@ -22,6 +22,12 @@ public class FileProcessingTask {
     private boolean isPublic; // 文件是否公开
     private String taskType; // 任务类型
     private String requesterId; // 发起重试的用户
+    private Long documentId; // Logical upload identity; MD5 is only a physical content key.
+
+    public FileProcessingTask(String fileMd5,String filePath,String fileName,String userId,String orgTag,
+            boolean isPublic,String taskType,String requesterId) {
+        this(fileMd5,filePath,fileName,userId,orgTag,isPublic,taskType,requesterId,null);
+    }
     
     /**
      * 向后兼容的构造函数

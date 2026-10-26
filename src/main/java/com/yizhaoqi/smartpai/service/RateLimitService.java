@@ -46,6 +46,10 @@ public class RateLimitService {
             int estimatedPromptTokens,
             int maxCompletionTokens
     ) {
+        if (!usageQuotaService.isLlmUsageEnabled()) {
+            return UsageQuotaService.TokenReservationBundle.noop("llm", userId);
+        }
+
         RateLimitConfigService.TokenBudgetView limit = rateLimitConfigService.getCurrentSettings().llmGlobalToken();
         return usageQuotaService.reserveLlmTokensWithGlobalBudget(
                 userId,
@@ -65,6 +69,10 @@ public class RateLimitService {
     }
 
     public UsageQuotaService.TokenReservationBundle reserveEmbeddingUploadUsage(String userId, java.util.List<String> texts) {
+        if (!usageQuotaService.isEmbeddingUsageEnabled()) {
+            return UsageQuotaService.TokenReservationBundle.noop("embedding-upload", userId);
+        }
+
         RateLimitConfigService.TokenBudgetView limit = rateLimitConfigService.getCurrentSettings().embeddingUploadToken();
         return usageQuotaService.reserveEmbeddingTokensWithGlobalBudget(
                 userId,
@@ -81,6 +89,10 @@ public class RateLimitService {
 
     public UsageQuotaService.TokenReservationBundle reserveEmbeddingQueryUsage(String userId, java.util.List<String> texts) {
         checkEmbeddingQueryByUser(userId);
+        if (!usageQuotaService.isEmbeddingUsageEnabled()) {
+            return UsageQuotaService.TokenReservationBundle.noop("embedding-query", userId);
+        }
+
         RateLimitConfigService.TokenBudgetView limit = rateLimitConfigService.getCurrentSettings().embeddingQueryGlobalToken();
         return usageQuotaService.reserveEmbeddingTokensWithGlobalBudget(
                 userId,

@@ -8,5 +8,8 @@
     "*": {
       "*": ["./src/*"]
     }
+  },
+  "devDependencies": {
+    "@unocss/core": "66.1.1"
   }
 }

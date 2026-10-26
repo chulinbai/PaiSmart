@@ -1,0 +1,92 @@
+{
+  "mappings": {
+    "properties": {
+      "id": {
+        "type": "keyword"
+      },
+      "itemId": {
+        "type": "keyword"
+      },
+      "fileMd5": {
+        "type": "keyword"
+      },
+      "fileName": {
+        "type": "keyword"
+      },
+      "knowledgeType": {
+        "type": "keyword"
+      },
+      "searchText": {
+        "type": "text",
+        "analyzer": "ik_max_word",
+        "search_analyzer": "ik_smart"
+      },
+      "vector": {
+        "type": "dense_vector",
+        "dims": 2048,
+        "index": true,
+        "similarity": "cosine"
+      },
+      "modelVersion": {
+        "type": "keyword"
+      },
+      "userId": {
+        "type": "keyword"
+      },
+      "orgTag": {
+        "type": "keyword"
+      },
+      "isPublic": {
+        "type": "boolean"
+      },
+      "chunkId": {
+        "type": "integer"
+      },
+      "pageNumber": {
+        "type": "integer"
+      },
+      "anchorText": {
+        "type": "text",
+        "index": false
+      },
+      "textContent": {
+        "type": "text",
+        "analyzer": "ik_max_word",
+        "search_analyzer": "ik_smart"
+      },
+      "imageText": {
+        "type": "text",
+        "analyzer": "ik_max_word",
+        "search_analyzer": "ik_smart"
+      },
+      "imageSourceType": {
+        "type": "keyword"
+      },
+      "imageUrl": {
+        "type": "keyword",
+        "index": false
+      },
+      "bucketName": {
+        "type": "keyword"
+      },
+      "objectName": {
+        "type": "keyword"
+      },
+      "embeddedImageId": {
+        "type": "keyword"
+      },
+      "imageSequence": {
+        "type": "integer"
+      },
+      "contentType": {
+        "type": "keyword"
+      },
+      "width": {
+        "type": "integer"
+      },
+      "height": {
+        "type": "integer"
+      }
+    }
+  }
+}

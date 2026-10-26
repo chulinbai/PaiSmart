@@ -21,6 +21,17 @@ function handleCopy(content: string) {
 }
 
 const chatStore = useChatStore();
+const outcomeLabel = computed(() => {
+  if (props.msg.persistenceStatus === 'DELAYED') return '保存延迟，正在重试';
+  if (props.msg.generationStatus === 'FINALIZING') return '正在保存';
+  const labels: Record<string, string> = { INCOMPLETE: '回答已中断，已保留收到的内容', CANCELLED: '已停止生成', REJECTED: '模型拒绝了本次请求', FAILED: '生成失败', RECOVERABLE: '服务已重启，请重新生成' };
+  return labels[props.msg.generationStatus || ''] || '';
+});
+function regenerate() {
+  const index = chatStore.list.indexOf(props.msg);
+  const question = chatStore.list.slice(0, index).reverse().find(item => item.role === 'user')?.content;
+  if (question) chatStore.regenerationRequest = { question, nonce: Date.now() };
+}
 const feedbackSubmitting = ref<Record<string, boolean>>({});
 
 function getMessageFeedbackKey(message: Api.Chat.Message) {
@@ -72,6 +83,7 @@ const sourceFiles = ref<Array<{fileName: string, id: string, referenceNumber: nu
 const bareUrlPattern = /https?:\/\/[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+/g;
 const toolNameLabels: Record<string, string> = {
   search_knowledge: '检索知识库',
+  search_graph: '检索知识图谱',
   generate_summary: '生成知识摘要',
   submit_feedback: '记录反馈',
   knowledge_stats: '读取知识库统计'
@@ -235,6 +247,17 @@ function openReferencePreviewPage(payload: {
   matchedChunkText?: string | null;
   score?: number | null;
   chunkId?: number | null;
+  itemId?: string | null;
+  knowledgeType?: Api.Chat.ReferenceEvidence['knowledgeType'];
+  searchText?: string | null;
+  imageText?: string | null;
+  imageSourceType?: Api.Chat.ReferenceEvidence['imageSourceType'];
+  imageUrl?: string | null;
+  embeddedImageId?: string | null;
+  imageSequence?: number | null;
+  contentType?: string | null;
+  width?: number | null;
+  height?: number | null;
   fileName: string;
   fileMd5?: string | null;
   pageNumber?: number | null;
@@ -325,6 +348,17 @@ async function handleSourceFileClick(fileInfo: {
         matchedChunkText: persistedDetail.matchedChunkText,
         score: persistedDetail.score,
         chunkId: persistedDetail.chunkId,
+        itemId: persistedDetail.itemId,
+        knowledgeType: persistedDetail.knowledgeType,
+        searchText: persistedDetail.searchText,
+        imageText: persistedDetail.imageText,
+        imageSourceType: persistedDetail.imageSourceType,
+        imageUrl: persistedDetail.imageUrl,
+        embeddedImageId: persistedDetail.embeddedImageId,
+        imageSequence: persistedDetail.imageSequence,
+        contentType: persistedDetail.contentType,
+        width: persistedDetail.width,
+        height: persistedDetail.height,
         sessionId: referenceSessionId,
         referenceNumber
       });
@@ -344,6 +378,17 @@ async function handleSourceFileClick(fileInfo: {
       matchedChunkText: detail?.matchedChunkText,
       score: detail?.score,
       chunkId: detail?.chunkId,
+      itemId: detail?.itemId,
+      knowledgeType: detail?.knowledgeType,
+      searchText: detail?.searchText,
+      imageText: detail?.imageText,
+      imageSourceType: detail?.imageSourceType,
+      imageUrl: detail?.imageUrl,
+      embeddedImageId: detail?.embeddedImageId,
+      imageSequence: detail?.imageSequence,
+      contentType: detail?.contentType,
+      width: detail?.width,
+      height: detail?.height,
       sessionId: referenceSessionId,
       referenceNumber
     });
@@ -391,15 +436,17 @@ async function handleSourceFileClick(fileInfo: {
     <NText v-if="msg.status === 'pending' || (msg.status === 'loading' && msg.role === 'assistant' && !msg.content)">
       <icon-eos-icons:three-dots-loading class="ml-12 mt-2 text-8" />
     </NText>
-    <NText v-else-if="msg.status === 'error'" class="ml-12 mt-2 italic color-#d03050">
+    <NText v-else-if="msg.status === 'error' && !msg.content" class="ml-12 mt-2 italic color-#d03050">
       {{ msg.content || '服务器繁忙，请稍后再试' }}
     </NText>
     <div v-else-if="msg.role === 'assistant'" class="mt-2 pl-12" @click="handleContentClick">
       <VueMarkdownIt :content="content" />
     </div>
     <NText v-else-if="msg.role === 'user'" class="ml-12 mt-2 text-4">{{ content }}</NText>
+    <NText v-if="outcomeLabel && msg.role === 'assistant'" class="ml-12 mt-2 text-3 color-gray-500">{{ outcomeLabel }}</NText>
     <NDivider class="ml-12 w-[calc(100%-3rem)] mb-0! mt-2!" />
     <div class="ml-12 flex gap-2">
+      <NButton v-if="msg.role === 'assistant' && ['finished', 'error'].includes(msg.status || '')" quaternary @click="regenerate">重新生成</NButton>
       <NButton quaternary title="复制回答" aria-label="复制回答" @click="handleCopy(msg.content)">
         <template #icon>
           <icon-mynaui:copy />

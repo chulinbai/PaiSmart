@@ -52,6 +52,9 @@ public class ModelProviderConfig {
     @Column(name = "embedding_dimension")
     private Integer embeddingDimension;
 
+    @Column(name = "context_window_tokens")
+    private Integer contextWindowTokens;
+
     @Column(name = "enabled", nullable = false)
     private boolean enabled = true;
 

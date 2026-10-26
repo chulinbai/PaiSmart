@@ -1,6 +1,6 @@
 package com.yizhaoqi.smartpai.controller;
 
-import com.yizhaoqi.smartpai.service.HybridSearchService;
+import com.yizhaoqi.smartpai.service.MultimodalSearchService;
 import com.yizhaoqi.smartpai.utils.LogUtils;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.web.bind.annotation.*;
@@ -17,7 +17,7 @@ import java.util.Collections;
 public class SearchController {
 
     @Autowired
-    private HybridSearchService hybridSearchService;
+    private MultimodalSearchService multimodalSearchService;
 
     /**
      * 混合检索接口
@@ -52,14 +52,9 @@ public class SearchController {
             LogUtils.logBusiness("HYBRID_SEARCH", userId != null ? userId : "anonymous", 
                     "开始混合检索: query=%s, topK=%d", query, topK);
             
-            List<SearchResult> results;
-            if (userId != null) {
-                // 如果有用户ID，使用带权限的搜索
-                results = hybridSearchService.searchWithPermission(query, userId, topK);
-            } else {
-                // 如果没有用户ID，使用普通搜索（仅公开内容）
-                results = hybridSearchService.search(query, topK);
-            }
+            List<SearchResult> results = userId != null
+                    ? multimodalSearchService.searchWithPermission(query, userId, topK)
+                    : Collections.emptyList();
             
             LogUtils.logUserOperation(userId != null ? userId : "anonymous", "HYBRID_SEARCH", 
                     "search_query", "SUCCESS");
@@ -86,5 +81,71 @@ public class SearchController {
             errorBody.put("data", Collections.emptyList());
             return errorBody;
         }
+    }
+
+    @GetMapping("/multimodal")
+    public Map<String, Object> multimodalSearch(@RequestParam String query,
+                                                @RequestParam(defaultValue = "10") int topK,
+                                                @RequestAttribute(value = "userId", required = false) String userId) {
+        return doMultimodalSearch(query, null, topK, userId);
+    }
+
+    @PostMapping("/multimodal")
+    public Map<String, Object> multimodalSearch(@RequestBody MultimodalSearchRequest request,
+                                                @RequestAttribute(value = "userId", required = false) String userId) {
+        String query = firstNonBlank(request == null ? null : request.query(), request == null ? null : request.text());
+        String image = request == null ? null : request.image();
+        int topK = request == null || request.topK() == null ? 10 : request.topK();
+        return doMultimodalSearch(query, image, topK, userId);
+    }
+
+    private Map<String, Object> doMultimodalSearch(String query, String image, int topK, String userId) {
+        LogUtils.PerformanceMonitor monitor = LogUtils.startPerformanceMonitor("MULTIMODAL_SEARCH");
+        try {
+            int effectiveTopK = Math.max(1, Math.min(topK, 50));
+            LogUtils.logBusiness("MULTIMODAL_SEARCH", userId != null ? userId : "anonymous",
+                    "开始多模态检索: query=%s, hasImage=%s, topK=%d", query, image != null && !image.isBlank(), effectiveTopK);
+
+            if ((query == null || query.isBlank()) && (image == null || image.isBlank())) {
+                Map<String, Object> errorBody = new HashMap<>(4);
+                errorBody.put("code", 400);
+                errorBody.put("message", "query/text 与 image 至少提供一个");
+                errorBody.put("data", Collections.emptyList());
+                return errorBody;
+            }
+
+            List<SearchResult> results = userId != null
+                    ? multimodalSearchService.searchWithPermission(query, image, userId, effectiveTopK)
+                    : Collections.emptyList();
+
+            monitor.end("多模态检索成功");
+            Map<String, Object> responseBody = new HashMap<>(4);
+            responseBody.put("code", 200);
+            responseBody.put("message", "success");
+            responseBody.put("data", results);
+            return responseBody;
+        } catch (Exception e) {
+            LogUtils.logBusinessError("MULTIMODAL_SEARCH", userId != null ? userId : "anonymous",
+                    "多模态检索失败: query=%s", e, query);
+            monitor.end("多模态检索失败: " + e.getMessage());
+            Map<String, Object> errorBody = new HashMap<>(4);
+            errorBody.put("code", 500);
+            errorBody.put("message", e.getMessage());
+            errorBody.put("data", Collections.emptyList());
+            return errorBody;
+        }
+    }
+
+    private String firstNonBlank(String first, String second) {
+        if (first != null && !first.isBlank()) {
+            return first;
+        }
+        if (second != null && !second.isBlank()) {
+            return second;
+        }
+        return null;
+    }
+
+    public record MultimodalSearchRequest(String query, String text, String image, Integer topK) {
     }
 }

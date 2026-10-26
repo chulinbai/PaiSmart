@@ -5,9 +5,15 @@ import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.web.reactive.function.client.WebClient;
+import io.minio.GetObjectResponse;
+import javax.imageio.ImageIO;
+import java.awt.image.BufferedImage;
+import java.io.ByteArrayOutputStream;
 import java.util.List;
 import java.util.Map;
 import java.util.ArrayList;
+import java.util.Base64;
+import java.util.LinkedHashMap;
 import java.util.HashMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
@@ -19,10 +25,13 @@ import java.util.function.Consumer;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.yizhaoqi.smartpai.entity.SearchResult;
+import com.yizhaoqi.smartpai.model.KnowledgeMultimodalItem;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import com.yizhaoqi.smartpai.config.AiProperties;
 import com.yizhaoqi.smartpai.service.ModelProviderConfigService;
+import com.yizhaoqi.smartpai.service.PdfImageExtractionService;
+import com.yizhaoqi.smartpai.service.UploadService;
 import com.yizhaoqi.smartpai.service.UsageQuotaService;
 import reactor.core.Disposable;
 
@@ -35,20 +44,28 @@ public class DeepSeekClient {
     private final AiProperties aiProperties;
     private final UsageQuotaService usageQuotaService;
     private final ModelProviderConfigService modelProviderConfigService;
+    private final UploadService uploadService;
+    private final PdfImageExtractionService pdfImageExtractionService;
     private final ObjectMapper objectMapper;
     private static final Logger logger = LoggerFactory.getLogger(DeepSeekClient.class);
+
+    @Value("${llm.multimodal.max-images-per-answer:4}")
+    private int maxImagesPerAnswer;
     
     public DeepSeekClient(@Value("${deepseek.api.url}") String apiUrl,
                          @Value("${deepseek.api.key}") String apiKey,
                          @Value("${deepseek.api.model}") String model,
                          AiProperties aiProperties,
                          UsageQuotaService usageQuotaService,
-                         ModelProviderConfigService modelProviderConfigService) {
-        WebClient.Builder builder = WebClient.builder().baseUrl(apiUrl);
+                         ModelProviderConfigService modelProviderConfigService,
+                         UploadService uploadService,
+                         PdfImageExtractionService pdfImageExtractionService) {
+        String normalizedApiUrl = ModelProviderConfigService.normalizeOpenAiCompatibleBaseUrl(apiUrl);
+        WebClient.Builder builder = WebClient.builder().baseUrl(normalizedApiUrl);
         
         // 只有当 API key 不为空时才添加 Authorization header
         if (apiKey != null && !apiKey.trim().isEmpty()) {
-            builder.defaultHeader(HttpHeaders.AUTHORIZATION, "Bearer " + apiKey);
+            builder.defaultHeader(HttpHeaders.AUTHORIZATION, "Bearer " + apiKey.trim());
         }
         
         this.webClient = builder.build();
@@ -57,6 +74,8 @@ public class DeepSeekClient {
         this.aiProperties = aiProperties;
         this.usageQuotaService = usageQuotaService;
         this.modelProviderConfigService = modelProviderConfigService;
+        this.uploadService = uploadService;
+        this.pdfImageExtractionService = pdfImageExtractionService;
         this.objectMapper = new ObjectMapper();
     }
     
@@ -97,6 +116,118 @@ public class DeepSeekClient {
             usageQuotaService.abortReservation(reservation);
             throw e;
         }
+    }
+
+    public void streamResponseWithImages(String requesterId,
+                                         String userMessage,
+                                         String context,
+                                         List<Map<String, String>> history,
+                                         List<SearchResult> searchResults,
+                                         Consumer<String> onChunk,
+                                         Consumer<Throwable> onError) {
+        List<Map<String, Object>> imageContent = buildImageQuestionContent(userMessage, searchResults);
+        if (imageContent.isEmpty()) {
+            fallbackToTextResponse(requesterId, userMessage, context, history, onChunk, onError);
+            return;
+        }
+
+        Map<String, Object> request = buildImageAnswerRequest(userMessage, context, history, imageContent);
+        int estimatedPromptTokens = estimateMultimodalPromptTokens(userMessage, context, history, imageContent);
+        int maxCompletionTokens = aiProperties.getGeneration().getMaxTokens() != null
+                ? aiProperties.getGeneration().getMaxTokens()
+                : 2000;
+        UsageQuotaService.TokenReservation reservation = usageQuotaService.reserveLlmTokens(
+                requesterId, estimatedPromptTokens, maxCompletionTokens);
+        StreamUsageTracker usageTracker = new StreamUsageTracker(reservation, estimatedPromptTokens);
+        AtomicBoolean emitted = new AtomicBoolean(false);
+        Consumer<String> guardedChunkConsumer = chunk -> {
+            emitted.set(true);
+            onChunk.accept(chunk);
+        };
+
+        try {
+            webClient.post()
+                    .uri("/chat/completions")
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .bodyValue(request)
+                    .retrieve()
+                    .bodyToFlux(String.class)
+                    .subscribe(
+                            chunk -> processChunk(chunk, usageTracker, guardedChunkConsumer),
+                            error -> {
+                                if (!emitted.get()) {
+                                    usageTracker.settled = true;
+                                    usageQuotaService.abortReservation(reservation);
+                                    logger.warn("图文问答调用失败，降级为纯文本上下文: {}", error.getMessage(), error);
+                                    fallbackToTextResponse(requesterId, userMessage, context, history, onChunk, onError);
+                                    return;
+                                }
+                                settleUsage(usageTracker);
+                                onError.accept(error);
+                            },
+                            () -> settleUsage(usageTracker)
+                    );
+        } catch (Exception e) {
+            usageQuotaService.abortReservation(reservation);
+            logger.warn("图文问答请求构建或发送失败，降级为纯文本上下文: {}", e.getMessage(), e);
+            fallbackToTextResponse(requesterId, userMessage, context, history, onChunk, onError);
+        }
+    }
+
+    private void fallbackToTextResponse(String requesterId,
+                                        String userMessage,
+                                        String context,
+                                        List<Map<String, String>> history,
+                                        Consumer<String> onChunk,
+                                        Consumer<Throwable> onError) {
+        try {
+            streamResponse(requesterId, userMessage, context, history, onChunk, onError);
+        } catch (Exception fallbackException) {
+            onError.accept(fallbackException);
+        }
+    }
+
+    public boolean hasImageResults(List<SearchResult> searchResults) {
+        if (searchResults == null || searchResults.isEmpty()) {
+            return false;
+        }
+        return searchResults.stream().anyMatch(this::isImageResult);
+    }
+
+    public List<Map<String, Object>> buildImageQuestionContent(String userMessage, List<SearchResult> searchResults) {
+        List<ImageEvidence> evidences = resolveImageEvidences(searchResults);
+        if (evidences.isEmpty()) {
+            return List.of();
+        }
+
+        List<Map<String, Object>> content = new ArrayList<>();
+        content.add(textContentBlock("用户问题：\n" + nullToEmpty(userMessage)
+                + "\n\n下面是从知识库检索到的图片证据。请结合图片本身、图片上下文和已有 tool 文本结果回答；"
+                + "如果图片不可读或模型不支持图片，以 tool 文本结果中的图片上下文为准。"));
+        for (int i = 0; i < evidences.size(); i++) {
+            ImageEvidence evidence = evidences.get(i);
+            content.add(textContentBlock("图片证据 #" + (i + 1) + "\n" + evidence.description()));
+            content.add(imageUrlContentBlock(evidence.imageUrl()));
+        }
+        return content;
+    }
+
+    public List<Map<String, Object>> buildToolResultContent(String toolText, List<SearchResult> searchResults) {
+        List<ImageEvidence> evidences = resolveImageEvidences(searchResults);
+        if (evidences.isEmpty()) {
+            return List.of();
+        }
+
+        List<Map<String, Object>> content = new ArrayList<>();
+        content.add(textContentBlock(nullToEmpty(toolText)
+                + "\n\n以下图片是 search_knowledge 工具命中的图片证据。请把这些图片视为本次 tool_result 的一部分，"
+                + "结合上面的检索文本与图片内容回答；如果图片不可读，以检索文本中的图片上下文为准。"));
+        for (int i = 0; i < evidences.size(); i++) {
+            ImageEvidence evidence = evidences.get(i);
+            content.add(textContentBlock("图片证据 #" + (i + 1) + "\n" + evidence.description()));
+            content.add(imageUrlContentBlock(evidence.imageUrl()));
+        }
+        return content;
     }
 
     public String summarize(String requesterId, String topic, List<SearchResult> searchResults) {
@@ -245,6 +376,257 @@ public class DeepSeekClient {
             return new SummaryEndpoint(webClient, model, "deepseek");
         }
     }
+
+    private Map<String, Object> buildImageAnswerRequest(String userMessage,
+                                                        String context,
+                                                        List<Map<String, String>> history,
+                                                        List<Map<String, Object>> imageContent) {
+        Map<String, Object> request = new HashMap<>();
+        request.put("model", model);
+        request.put("messages", buildImageMessages(userMessage, context, history, imageContent));
+        request.put("stream", true);
+        request.put("stream_options", Map.of("include_usage", true));
+
+        AiProperties.Generation gen = aiProperties.getGeneration();
+        if (gen.getTemperature() != null) {
+            request.put("temperature", gen.getTemperature());
+        }
+        if (gen.getTopP() != null) {
+            request.put("top_p", gen.getTopP());
+        }
+        if (gen.getMaxTokens() != null) {
+            request.put("max_tokens", gen.getMaxTokens());
+        }
+        return request;
+    }
+
+    private List<Map<String, Object>> buildImageMessages(String userMessage,
+                                                         String context,
+                                                         List<Map<String, String>> history,
+                                                         List<Map<String, Object>> imageContent) {
+        List<Map<String, String>> textMessages = buildMessages(userMessage, context, history);
+        List<Map<String, Object>> messages = new ArrayList<>();
+        for (int i = 0; i < textMessages.size(); i++) {
+            Map<String, String> textMessage = textMessages.get(i);
+            Map<String, Object> message = new LinkedHashMap<>();
+            message.put("role", textMessage.get("role"));
+            if (i == textMessages.size() - 1 && "user".equals(textMessage.get("role"))) {
+                message.put("content", imageContent);
+            } else {
+                message.put("content", textMessage.get("content"));
+            }
+            messages.add(message);
+        }
+        return messages;
+    }
+
+    private int estimateMultimodalPromptTokens(String userMessage,
+                                               String context,
+                                               List<Map<String, String>> history,
+                                               List<Map<String, Object>> imageContent) {
+        int tokens = usageQuotaService.estimateTextTokens(nullToEmpty(userMessage))
+                + usageQuotaService.estimateTextTokens(nullToEmpty(context));
+        if (history != null) {
+            for (Map<String, String> message : history) {
+                tokens += 8;
+                tokens += usageQuotaService.estimateTextTokens(nullToEmpty(message.get("role")));
+                tokens += usageQuotaService.estimateTextTokens(nullToEmpty(message.get("content")));
+            }
+        }
+        for (Map<String, Object> block : imageContent) {
+            String type = String.valueOf(block.getOrDefault("type", ""));
+            if ("text".equals(type)) {
+                tokens += usageQuotaService.estimateTextTokens(String.valueOf(block.getOrDefault("text", "")));
+            } else if ("image_url".equals(type)) {
+                tokens += 256;
+            }
+        }
+        return Math.max(tokens, 1);
+    }
+
+    private List<ImageEvidence> resolveImageEvidences(List<SearchResult> searchResults) {
+        if (searchResults == null || searchResults.isEmpty()) {
+            return List.of();
+        }
+
+        List<ImageEvidence> evidences = new ArrayList<>();
+        int limit = Math.max(1, maxImagesPerAnswer);
+        for (SearchResult result : searchResults) {
+            if (evidences.size() >= limit) {
+                break;
+            }
+            if (!isImageResult(result)) {
+                continue;
+            }
+            try {
+                String imageUrl = resolveEvidenceImageUrl(result);
+                if (imageUrl == null || imageUrl.isBlank()) {
+                    continue;
+                }
+                evidences.add(new ImageEvidence(imageUrl, buildImageEvidenceDescription(result)));
+            } catch (Exception exception) {
+                logger.warn("检索图片证据解析失败，将仅使用文字上下文: fileMd5={}, itemId={}, page={}, image={}, error={}",
+                        result.getFileMd5(),
+                        result.getItemId(),
+                        result.getPageNumber(),
+                        result.getImageSequence(),
+                        exception.getMessage());
+            }
+        }
+        return evidences;
+    }
+
+    private boolean isImageResult(SearchResult result) {
+        if (result == null) {
+            return false;
+        }
+        String knowledgeType = result.getKnowledgeType();
+        return KnowledgeMultimodalItem.TYPE_DOCUMENT_IMAGE.equals(knowledgeType)
+                || KnowledgeMultimodalItem.TYPE_STANDALONE_IMAGE.equals(knowledgeType);
+    }
+
+    private String resolveEvidenceImageUrl(SearchResult result) throws Exception {
+        if (KnowledgeMultimodalItem.TYPE_STANDALONE_IMAGE.equals(result.getKnowledgeType())) {
+            String contentType = normalizeImageContentType(result.getContentType());
+            if (isLikelyPublicImageUrl(result.getImageUrl())
+                    && (contentType.isBlank() || isDeepSeekSupportedImageType(contentType))) {
+                return result.getImageUrl();
+            }
+            if (result.getFileMd5() == null || result.getFileMd5().isBlank()) {
+                return contentType.isBlank() || isDeepSeekSupportedImageType(contentType) ? result.getImageUrl() : null;
+            }
+            try (GetObjectResponse imageStream = uploadService.getMergedFileStream(result.getFileMd5())) {
+                return toDeepSeekCompatibleDataUrl(imageStream.readAllBytes(), contentType);
+            }
+        }
+        if (KnowledgeMultimodalItem.TYPE_DOCUMENT_IMAGE.equals(result.getKnowledgeType())) {
+            if (result.getFileMd5() == null || result.getPageNumber() == null || result.getImageSequence() == null) {
+                return null;
+            }
+            try (GetObjectResponse pdfStream = uploadService.getMergedFileStream(result.getFileMd5())) {
+                PdfImageExtractionService.PdfEmbeddedImage image = pdfImageExtractionService.extractOne(
+                        pdfStream,
+                        result.getPageNumber(),
+                        result.getImageSequence()
+                );
+                return image.toDataUrl();
+            }
+        }
+        return null;
+    }
+
+    private String toDeepSeekCompatibleDataUrl(byte[] imageBytes, String contentType) throws Exception {
+        if (imageBytes == null || imageBytes.length == 0) {
+            return null;
+        }
+        String normalizedContentType = normalizeImageContentType(contentType);
+        if (isDeepSeekSupportedImageType(normalizedContentType)) {
+            return "data:" + normalizedContentType + ";base64,"
+                    + Base64.getEncoder().encodeToString(imageBytes);
+        }
+
+        BufferedImage image = ImageIO.read(new java.io.ByteArrayInputStream(imageBytes));
+        if (image == null) {
+            return null;
+        }
+        try (ByteArrayOutputStream outputStream = new ByteArrayOutputStream()) {
+            ImageIO.write(image, "png", outputStream);
+            return "data:image/png;base64,"
+                    + Base64.getEncoder().encodeToString(outputStream.toByteArray());
+        }
+    }
+
+    private boolean isDeepSeekSupportedImageType(String contentType) {
+        return switch (normalizeImageContentType(contentType)) {
+            case "image/jpeg", "image/png", "image/gif", "image/webp" -> true;
+            default -> false;
+        };
+    }
+
+    private String normalizeImageContentType(String contentType) {
+        if (contentType == null || contentType.isBlank()) {
+            return "";
+        }
+        String normalized = contentType.trim().toLowerCase();
+        if ("image/jpg".equals(normalized)) {
+            return "image/jpeg";
+        }
+        return normalized;
+    }
+
+    private boolean isLikelyPublicImageUrl(String imageUrl) {
+        if (imageUrl == null || imageUrl.isBlank()) {
+            return false;
+        }
+        String normalized = imageUrl.toLowerCase();
+        if (normalized.startsWith("data:image/")) {
+            return true;
+        }
+        return (normalized.startsWith("http://") || normalized.startsWith("https://"))
+                && !normalized.contains("localhost")
+                && !normalized.contains("127.0.0.1")
+                && !normalized.contains("[::1]");
+    }
+
+    private String buildImageEvidenceDescription(SearchResult result) {
+        StringBuilder description = new StringBuilder();
+        description.append("来源：")
+                .append(nullToDash(result.getFileName()))
+                .append("，类型：")
+                .append(nullToDash(result.getKnowledgeType()));
+        if (result.getPageNumber() != null) {
+            description.append("，页码：").append(result.getPageNumber());
+        }
+        if (result.getImageSequence() != null) {
+            description.append("，页内图片序号：").append(result.getImageSequence());
+        }
+        if (result.getEmbeddedImageId() != null && !result.getEmbeddedImageId().isBlank()) {
+            description.append("，embeddedImageId：").append(result.getEmbeddedImageId());
+        }
+        String imageText = firstNonBlank(result.getImageText(), result.getSearchText(), result.getMatchedChunkText());
+        if (imageText != null && !imageText.isBlank()) {
+            description.append("\n图片文字上下文：").append(limitText(imageText, 1000));
+        }
+        return description.toString();
+    }
+
+    private Map<String, Object> textContentBlock(String text) {
+        Map<String, Object> block = new LinkedHashMap<>();
+        block.put("type", "text");
+        block.put("text", text == null ? "" : text);
+        return block;
+    }
+
+    private Map<String, Object> imageUrlContentBlock(String imageUrl) {
+        Map<String, Object> image = new LinkedHashMap<>();
+        image.put("url", imageUrl);
+        image.put("detail", "auto");
+
+        Map<String, Object> block = new LinkedHashMap<>();
+        block.put("type", "image_url");
+        block.put("image_url", image);
+        return block;
+    }
+
+    private String firstNonBlank(String... values) {
+        if (values == null) {
+            return null;
+        }
+        for (String value : values) {
+            if (value != null && !value.isBlank()) {
+                return value;
+            }
+        }
+        return null;
+    }
+
+    private String nullToEmpty(String value) {
+        return value == null ? "" : value;
+    }
+
+    private String nullToDash(String value) {
+        return value == null || value.isBlank() ? "-" : value;
+    }
     
     private Map<String, Object> buildRequest(String userMessage, 
                                            String context,
@@ -351,6 +733,9 @@ public class DeepSeekClient {
     }
 
     private record SummaryEndpoint(WebClient webClient, String model, String provider) {
+    }
+
+    private record ImageEvidence(String imageUrl, String description) {
     }
     
     private List<Map<String, String>> buildMessages(String userMessage,

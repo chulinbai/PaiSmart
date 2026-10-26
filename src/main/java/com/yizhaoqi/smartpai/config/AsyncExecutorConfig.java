@@ -7,6 +7,13 @@ import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 @Configuration
 public class AsyncExecutorConfig {
 
+    @Bean(name="knowledgeRetrievalExecutor")
+    public ThreadPoolTaskExecutor knowledgeRetrievalExecutor() {
+        ThreadPoolTaskExecutor executor=new ThreadPoolTaskExecutor();executor.setThreadNamePrefix("knowledge-retrieval-");
+        executor.setCorePoolSize(2);executor.setMaxPoolSize(8);executor.setQueueCapacity(32);
+        executor.setWaitForTasksToCompleteOnShutdown(false);executor.initialize();return executor;
+    }
+
     @Bean(name = "chatMonitorExecutor")
     public ThreadPoolTaskExecutor chatMonitorExecutor() {
         ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();

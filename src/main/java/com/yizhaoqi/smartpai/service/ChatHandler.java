@@ -3,8 +3,11 @@ package com.yizhaoqi.smartpai.service;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.yizhaoqi.smartpai.client.DeepSeekClient;
 import com.yizhaoqi.smartpai.entity.SearchResult;
 import com.yizhaoqi.smartpai.exception.RateLimitExceededException;
+import com.yizhaoqi.smartpai.model.AgentRun;
+import com.yizhaoqi.smartpai.model.ContextEvent;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -18,6 +21,8 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
+import java.util.LinkedHashMap;
+import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -39,6 +44,14 @@ import java.util.function.Consumer;
  */
 @Service
 public class ChatHandler {
+    @org.springframework.beans.factory.annotation.Autowired(required=false)
+    private com.yizhaoqi.smartpai.service.knowledge.KnowledgeRetrievalCoordinator knowledgeCoordinator;
+    @org.springframework.beans.factory.annotation.Autowired(required=false)
+    private com.yizhaoqi.smartpai.config.KnowledgeRagProperties knowledgeProperties;
+    @org.springframework.beans.factory.annotation.Autowired
+    @Qualifier("knowledgeRetrievalExecutor")
+    private ThreadPoolTaskExecutor knowledgeRetrievalExecutor;
+    private final Map<String,List<java.util.concurrent.Future<AgentToolRegistry.ToolExecutionResult>>> knowledgeToolFutures=new ConcurrentHashMap<>();
     
     private static final Logger logger = LoggerFactory.getLogger(ChatHandler.class);
     private static final int MAX_CONTEXT_SNIPPET_LEN = 300;
@@ -48,14 +61,18 @@ public class ChatHandler {
     private static final int MAX_REACT_ROUNDS = 4;
     private static final int MAX_REACT_TOOL_CALLS = 8;
     private static final int REACT_MAX_COMPLETION_TOKENS = 2000;
+    private static final int MAX_LENGTH_CONTINUATIONS = 1;
+    private static final String CONTINUATION_PROMPT =
+            "上一个回答因输出长度上限而中断。请紧接已有回答继续，不要重复前文，不要调用工具。";
     private final RedisTemplate<String, String> redisTemplate;
-    private final HybridSearchService searchService;
     private final LlmProviderRouter llmProviderRouter;
     private final RateLimitService rateLimitService;
     private final ConversationService conversationService;
     private final ChatGenerationStateService chatGenerationStateService;
     private final ChatSessionRegistry chatSessionRegistry;
     private final AgentToolRegistry agentToolRegistry;
+    private final AgentContextService agentContextService;
+    private final DeepSeekClient deepSeekClient;
     private final ThreadPoolTaskExecutor chatMonitorExecutor;
     private final ObjectMapper objectMapper;
     
@@ -71,25 +88,33 @@ public class ChatHandler {
     private final KeySetView<String, Boolean> cancelledGenerations = ConcurrentHashMap.newKeySet();
     // 用于存储每次生成任务的引用映射：generationId -> {referenceNumber -> detail}
     private final Map<String, Map<Integer, ReferenceInfo>> generationReferenceMappings = new ConcurrentHashMap<>();
+    private final Map<String, AgentContextService.ContextBundle> generationContexts = new ConcurrentHashMap<>();
+    @org.springframework.beans.factory.annotation.Autowired private ChatRunFinalizer runFinalizer;
+    private final Map<String, GenerationRequest> generationRequests = new ConcurrentHashMap<>();
+    private final Map<String, LlmCallContext> logicalCalls = new ConcurrentHashMap<>();
+    private final java.util.Set<String> sideEffectGenerations = ConcurrentHashMap.newKeySet();
+    private record GenerationRequest(String user,String question,String conversation) {}
 
     public ChatHandler(RedisTemplate<String, String> redisTemplate,
-                      HybridSearchService searchService,
                       LlmProviderRouter llmProviderRouter,
                       RateLimitService rateLimitService,
                       ConversationService conversationService,
                       ChatGenerationStateService chatGenerationStateService,
                       ChatSessionRegistry chatSessionRegistry,
                       AgentToolRegistry agentToolRegistry,
+                      AgentContextService agentContextService,
+                      DeepSeekClient deepSeekClient,
                       ObjectMapper objectMapper,
                       @Qualifier("chatMonitorExecutor") ThreadPoolTaskExecutor chatMonitorExecutor) {
         this.redisTemplate = redisTemplate;
-        this.searchService = searchService;
         this.llmProviderRouter = llmProviderRouter;
         this.rateLimitService = rateLimitService;
         this.conversationService = conversationService;
         this.chatGenerationStateService = chatGenerationStateService;
         this.chatSessionRegistry = chatSessionRegistry;
         this.agentToolRegistry = agentToolRegistry;
+        this.agentContextService = agentContextService;
+        this.deepSeekClient = deepSeekClient;
         this.objectMapper = objectMapper;
         this.chatMonitorExecutor = chatMonitorExecutor;
     }
@@ -107,10 +132,37 @@ public class ChatHandler {
             ChatGenerationStateService.GenerationSnapshot generation =
                     chatGenerationStateService.createGeneration(userId, conversationId, userMessage);
             generationId = generation.generationId();
+            chatSessionRegistry.bindGeneration(generationId, session);
             final String finalConversationId = conversationId;
             final String finalGenerationId = generationId;
             logger.info("会话ID: {}, 用户ID: {}", conversationId, userId);
-            sendGenerationStart(userId, finalGenerationId, finalConversationId);
+            Long numericUserId = Long.parseLong(userId);
+            agentContextService.startRun(numericUserId, finalConversationId, finalGenerationId);
+            if(runFinalizer!=null) runFinalizer.register(finalGenerationId);
+            generationRequests.put(finalGenerationId,new GenerationRequest(userId,userMessage,conversationId));
+            agentContextService.appendEvent(numericUserId, finalConversationId, finalGenerationId,
+                    ContextEvent.EventType.MESSAGE, "user", userMessage, 100, false, Map.of());
+            AgentContextService.ContextBundle contextBundle = agentContextService.buildContext(
+                    numericUserId,
+                    finalConversationId,
+                    llmProviderRouter.buildReActSystemInstruction("", buildRecentFeedbackGuidance(userId)),
+                    agentToolRegistry.getTools(),
+                    REACT_MAX_COMPLETION_TOKENS
+            );
+            if (contextBundle.requiresSynchronousCompaction()) {
+                agentContextService.compact(numericUserId, finalConversationId);
+                contextBundle = agentContextService.buildContext(
+                        numericUserId,
+                        finalConversationId,
+                        llmProviderRouter.buildReActSystemInstruction("", buildRecentFeedbackGuidance(userId)),
+                        agentToolRegistry.getTools(),
+                        REACT_MAX_COMPLETION_TOKENS
+                );
+            }
+            generationContexts.put(finalGenerationId, contextBundle);
+            sendGenerationStart(userId, finalGenerationId, finalConversationId, contextBundle);
+            boolean schedulePrecompaction = contextBundle.shouldPrecompact()
+                    && !contextBundle.requiresSynchronousCompaction();
 
             // 为当前生成任务创建响应构建器
             responseBuilders.put(finalGenerationId, new StringBuilder());
@@ -118,15 +170,14 @@ public class ChatHandler {
             CompletableFuture<String> responseFuture = new CompletableFuture<>();
             responseFutures.put(finalGenerationId, responseFuture);
 
-            // 2. 获取对话历史
-            List<Map<String, String>> history = getConversationHistory(conversationId);
-            logger.debug("获取到 {} 条历史对话", history.size());
-
             // 3. 异步执行 ReAct 决策循环：模型按需返回 tool_calls，避免在 WebSocket 处理线程上阻塞 90s+ 的工具流
+            boolean generationScheduled = false;
             try {
                 chatMonitorExecutor.execute(() ->
-                        runReActLoopSafely(userId, userMessage, finalConversationId, finalGenerationId, history, responseFuture));
+                        runReActLoopSafely(userId, userMessage, finalConversationId, finalGenerationId, responseFuture));
+                generationScheduled = true;
             } catch (RejectedExecutionException ex) {
+                if(runFinalizer!=null) {failDurably(finalGenerationId,ex);return;}
                 logger.warn("聊天处理线程池已满，generationId: {}", finalGenerationId);
                 RuntimeException busyException = new RuntimeException("系统繁忙，请稍后重试");
                 chatGenerationStateService.markFailed(finalGenerationId, busyException.getMessage());
@@ -134,16 +185,35 @@ public class ChatHandler {
                 sendCompletionNotification(userId, finalGenerationId, finalConversationId, true, false);
                 cleanupGenerationState(finalGenerationId, ex);
             }
+            if (generationScheduled && schedulePrecompaction) {
+                try {
+                    chatMonitorExecutor.execute(() -> {
+                        try {
+                            agentContextService.compact(numericUserId, finalConversationId);
+                        } catch (Exception exception) {
+                            logger.warn("Asynchronous context compaction failed: conversationId={}",
+                                    finalConversationId, exception);
+                        }
+                    });
+                } catch (RejectedExecutionException exception) {
+                    logger.debug("Context precompaction skipped because executor is busy: conversationId={}",
+                            finalConversationId);
+                }
+            }
 
         } catch (RateLimitExceededException e) {
-            sendRateLimitMessage(userId, null, e);
+            if(runFinalizer!=null && generationId!=null && runFinalizer.gate(generationId)!=null) {failDurably(generationId,e);return;}
+            sendRateLimitMessage(session, e);
         } catch (Exception e) {
+            if(runFinalizer!=null && generationId!=null && runFinalizer.gate(generationId)!=null) {failDurably(generationId,e);return;}
             logger.error("处理消息错误: {}", e.getMessage(), e);
             if (generationId != null) {
                 chatGenerationStateService.markFailed(generationId, e.getMessage());
-                cleanupGenerationState(generationId, e);
             }
             handleError(userId, generationId, e);
+            if (generationId != null) {
+                cleanupGenerationState(generationId, e);
+            }
         }
     }
 
@@ -151,11 +221,11 @@ public class ChatHandler {
                                     String userMessage,
                                     String conversationId,
                                     String generationId,
-                                    List<Map<String, String>> history,
                                     CompletableFuture<String> responseFuture) {
         try {
-            runReActLoop(userId, userMessage, conversationId, generationId, history, responseFuture);
+            runReActLoop(userId, userMessage, conversationId, generationId, responseFuture);
         } catch (Exception e) {
+            if(runFinalizer!=null) {failDurably(generationId,e);return;}
             logger.error("ReAct 循环执行失败: generationId={}", generationId, e);
             chatGenerationStateService.markFailed(generationId, e.getMessage());
             handleError(userId, generationId, e);
@@ -168,19 +238,19 @@ public class ChatHandler {
                               String userMessage,
                               String conversationId,
                               String generationId,
-                              List<Map<String, String>> history,
                               CompletableFuture<String> responseFuture) {
-        List<Map<String, Object>> messages = llmProviderRouter.buildReActMessages(
-                userMessage,
-                "",
-                history,
-                buildRecentFeedbackGuidance(userId)
-        );
+        AgentContextService.ContextBundle contextBundle = generationContexts.get(generationId);
+        if (contextBundle == null) {
+            throw new IllegalStateException("Context bundle missing for generation " + generationId);
+        }
+        List<Map<String, Object>> messages = new ArrayList<>(contextBundle.messages());
         int executedToolCalls = 0;
         int totalPromptTokens = 0;
         int totalCompletionTokens = 0;
 
-        for (int round = 1; round <= MAX_REACT_ROUNDS; round++) {
+        int roundLimit=knowledgeCoordinator!=null && knowledgeProperties!=null?Math.min(MAX_REACT_ROUNDS,Math.max(1,knowledgeProperties.getMaxDecisionRounds())):MAX_REACT_ROUNDS;
+        int toolLimit=knowledgeCoordinator!=null && knowledgeProperties!=null?Math.min(MAX_REACT_TOOL_CALLS,Math.max(1,knowledgeProperties.getMaxToolCalls())):MAX_REACT_TOOL_CALLS;
+        for (int round = 1; round <= roundLimit; round++) {
             if (finishCancelledGeneration(generationId, responseFuture, responseBuilders.get(generationId))) {
                 return;
             }
@@ -195,27 +265,80 @@ public class ChatHandler {
             totalPromptTokens += turn.promptTokens();
             totalCompletionTokens += turn.completionTokens();
 
+            FinishReasonKind finishReasonKind = classifyFinishReason(turn.finishReason());
+            if (finishReasonKind == FinishReasonKind.SAFETY) {
+                failForFinishReason(userId, conversationId, generationId, responseFuture,
+                        turn.finishReason(), "模型响应被安全策略拦截", 0);
+                return;
+            }
+            if (finishReasonKind == FinishReasonKind.LENGTH && !turn.toolCalls().isEmpty()) {
+                failForFinishReason(userId, conversationId, generationId, responseFuture,
+                        turn.finishReason(), "模型工具调用因长度限制而不完整", 0);
+                return;
+            }
+            if (finishReasonKind == FinishReasonKind.TOOL && turn.toolCalls().isEmpty()) {
+                failForFinishReason(userId, conversationId, generationId, responseFuture,
+                        turn.finishReason(), "模型声明了工具调用，但未返回有效工具参数", 0);
+                return;
+            }
+
             if (turn.toolCalls().isEmpty()) {
-                finalizeResponse(userId, userMessage, conversationId, generationId, responseFuture,
-                        responseBuilders.get(generationId),
-                        new LlmProviderRouter.StreamCompletion(turn.finishReason(), totalPromptTokens, totalCompletionTokens, turn.content().length()));
+                if(knowledgeCoordinator!=null) {
+                    appendFinalKnowledgeEvidence(generationId,userId,messages);
+                    turn=streamReActTurnBlocking(userId,conversationId,generationId,messages,List.of());
+                    if(turn==null) { cleanupGenerationState(generationId,null);return; }
+                    totalPromptTokens+=turn.promptTokens();totalCompletionTokens+=turn.completionTokens();
+                }
+                finishFinalTurn(userId, userMessage, conversationId, generationId, responseFuture,
+                        messages, turn, totalPromptTokens, totalCompletionTokens);
                 return;
             }
 
             messages.add(turn.assistantMessage());
+            String logicalCallId=logicalCalls.containsKey(generationId)?logicalCalls.get(generationId).logicalCallId():generationId;
+            if(runFinalizer!=null) agentContextService.appendEventOnce(Long.valueOf(userId),conversationId,generationId,
+                    ContextEvent.EventType.TOOL_CALL,"assistant",turn.content(),
+                    Map.of("tool_calls",turn.assistantMessage().get("tool_calls")),"toolturn:"+LlmUsageSettlementService.fingerprint(generationId+logicalCallId));
+            Map<String,java.util.concurrent.Future<AgentToolRegistry.ToolExecutionResult>> parallel=new LinkedHashMap<>();
+            if(knowledgeCoordinator!=null) {
+                int available=toolLimit-executedToolCalls;
+                for(var call:turn.toolCalls()) {
+                    if(available--<=0) break;
+                    if("search_knowledge".equals(call.name()) || "search_graph".equals(call.name())) {
+                        if(isGenerationCancelled(generationId)) break;
+                        sendToolCallStatus(userId,generationId,conversationId,call,"executing");
+                        var future=knowledgeRetrievalExecutor.submit(()->recordedTool(userId,conversationId,generationId,logicalCallId,call,
+                            ()->knowledgeCoordinator.retrieve(generationId,call.name(),call.arguments(),userId,
+                                ()->agentToolRegistry.executeTool(call.name(),call.arguments(),userId))));
+                        parallel.put(call.id(),future);
+                        knowledgeToolFutures.computeIfAbsent(generationId,k->new java.util.concurrent.CopyOnWriteArrayList<>()).add(future);
+                    }
+                }
+            }
             for (LlmProviderRouter.ToolCallDecision toolCall : turn.toolCalls()) {
+                if(finishCancelledGeneration(generationId,responseFuture,responseBuilders.get(generationId))) return;
+                if(runFinalizer==null) appendToolCallContext(userId, conversationId, generationId, toolCall);
                 ExecutedToolResult executedToolResult;
-                if (executedToolCalls >= MAX_REACT_TOOL_CALLS) {
+                if (executedToolCalls >= toolLimit) {
                     executedToolResult = new ExecutedToolResult(
                             "工具调用预算已用尽，本次工具未执行。请基于已有 tool 结果给出最终回答。",
                             false
                     );
                     sendToolCallStatus(userId, generationId, conversationId, toolCall, "failed");
                 } else {
-                    executedToolResult = executeToolForReAct(userId, userMessage, generationId, conversationId, toolCall);
+                    executedToolResult = parallel.containsKey(toolCall.id())
+                        ? awaitKnowledgeTool(parallel.get(toolCall.id()),userId,userMessage,generationId,conversationId,toolCall)
+                        : executeToolForReAct(userId, userMessage, generationId, conversationId, toolCall);
                     executedToolCalls++;
                 }
-                messages.add(toolMessage(toolCall.id(), executedToolResult.content()));
+                if(runFinalizer!=null && executedToolResult.toolResult()!=null) {
+                    agentContextService.decorateToolResult(conversationId,generationId,logicalCallId,toolCall.id(),executedToolResult.content(),
+                            toSerializableReferenceMappings(generationReferenceMappings.get(generationId)));
+                } else agentContextService.appendEvent(Long.parseLong(userId), conversationId, generationId,
+                        ContextEvent.EventType.TOOL_RESULT, "tool", executedToolResult.content(), 80, false,
+                        Map.of("tool_call_id", toolCall.id(), "tool", toolCall.name(),
+                                "streamedToUser", executedToolResult.streamedToUser()));
+                messages.add(toolMessage(toolCall.id(), buildToolMessageContent(executedToolResult)));
                 if (executedToolResult.streamedToUser()) {
                     finalizeResponse(userId, userMessage, conversationId, generationId, responseFuture,
                             responseBuilders.get(generationId),
@@ -234,6 +357,7 @@ public class ChatHandler {
                 "role", "user",
                 "content", "ReAct 轮次预算已用尽，请不要再调用工具，直接基于已有 tool 结果给出最终回答。"
         ));
+        if(knowledgeCoordinator!=null) appendFinalKnowledgeEvidence(generationId,userId,messages);
         LlmProviderRouter.ReActTurn finalTurn = streamReActTurnBlocking(
                 userId, conversationId, generationId, messages, List.of());
         if (finalTurn == null) {
@@ -242,9 +366,113 @@ public class ChatHandler {
         }
         totalPromptTokens += finalTurn.promptTokens();
         totalCompletionTokens += finalTurn.completionTokens();
+        finishFinalTurn(userId, userMessage, conversationId, generationId, responseFuture,
+                messages, finalTurn, totalPromptTokens, totalCompletionTokens);
+    }
+
+    void finishFinalTurn(String userId,
+                         String userMessage,
+                         String conversationId,
+                         String generationId,
+                         CompletableFuture<String> responseFuture,
+                         List<Map<String, Object>> messages,
+                         LlmProviderRouter.ReActTurn initialTurn,
+                         int totalPromptTokens,
+                         int totalCompletionTokens) {
+        LlmProviderRouter.ReActTurn finalTurn = initialTurn;
+        int continuationAttempts = 0;
+        FinishReasonKind finishReasonKind = classifyFinishReason(finalTurn.finishReason());
+
+        if (finishReasonKind == FinishReasonKind.SAFETY) {
+            failForFinishReason(userId, conversationId, generationId, responseFuture,
+                    finalTurn.finishReason(), "模型响应被安全策略拦截", continuationAttempts);
+            return;
+        }
+        if (!finalTurn.toolCalls().isEmpty()) {
+            failForFinishReason(userId, conversationId, generationId, responseFuture,
+                    finalTurn.finishReason(), "模型在最终回答阶段返回了无效工具调用", continuationAttempts);
+            return;
+        }
+        if (finishReasonKind == FinishReasonKind.TOOL) {
+            failForFinishReason(userId, conversationId, generationId, responseFuture,
+                    finalTurn.finishReason(), "模型声明了工具调用，但未返回有效工具参数", continuationAttempts);
+            return;
+        }
+
+        if (finishReasonKind == FinishReasonKind.LENGTH && continuationAttempts < MAX_LENGTH_CONTINUATIONS) {
+            logger.warn("模型回答达到长度上限，开始续写: generationId={}, finishReason={}",
+                    generationId, normalizeFinishReason(finalTurn.finishReason()));
+            messages.add(finalTurn.assistantMessage());
+            messages.add(Map.of("role", "user", "content", CONTINUATION_PROMPT));
+            continuationAttempts++;
+
+            LlmProviderRouter.ReActTurn continuationTurn = streamReActTurnBlocking(
+                    userId, conversationId, generationId, messages, List.of(), true);
+            if (continuationTurn == null) {
+                cleanupGenerationState(generationId, null);
+                return;
+            }
+            totalPromptTokens += continuationTurn.promptTokens();
+            totalCompletionTokens += continuationTurn.completionTokens();
+            finalTurn = continuationTurn;
+            finishReasonKind = classifyFinishReason(finalTurn.finishReason());
+
+            if (!finalTurn.toolCalls().isEmpty() || finishReasonKind == FinishReasonKind.TOOL) {
+                failForFinishReason(userId, conversationId, generationId, responseFuture,
+                        finalTurn.finishReason(), "续写回合返回了无效工具调用", continuationAttempts);
+                return;
+            }
+            if (finishReasonKind == FinishReasonKind.SAFETY) {
+                failForFinishReason(userId, conversationId, generationId, responseFuture,
+                        finalTurn.finishReason(), "续写响应被安全策略拦截", continuationAttempts);
+                return;
+            }
+        }
+
+        boolean truncated = finishReasonKind == FinishReasonKind.LENGTH;
+        if (finishReasonKind == FinishReasonKind.UNKNOWN) {
+            failForFinishReason(userId,conversationId,generationId,responseFuture,finalTurn.finishReason(),"模型结束原因未知",continuationAttempts);
+            return;
+        } else if (truncated) {
+            logger.warn("模型续写后仍达到长度上限，将保存为截断回答: generationId={}", generationId);
+        }
+
+        String finishReason = normalizeFinishReason(finalTurn.finishReason());
         finalizeResponse(userId, userMessage, conversationId, generationId, responseFuture,
                 responseBuilders.get(generationId),
-                new LlmProviderRouter.StreamCompletion(finalTurn.finishReason(), totalPromptTokens, totalCompletionTokens, finalTurn.content().length()));
+                new LlmProviderRouter.StreamCompletion(
+                        finishReason, totalPromptTokens, totalCompletionTokens, finalTurn.content().length()),
+                new CompletionOutcome(finishReason, truncated, continuationAttempts));
+    }
+
+    private void failForFinishReason(String userId,
+                                     String conversationId,
+                                     String generationId,
+                                     CompletableFuture<String> responseFuture,
+                                     String finishReason,
+                                     String message,
+                                     int continuationAttempts) {
+        String normalizedReason = normalizeFinishReason(finishReason);
+        if(runFinalizer!=null) {
+            AgentRun.RunStatus status=classifyFinishReason(finishReason)==FinishReasonKind.SAFETY?AgentRun.RunStatus.REJECTED:
+                    responseLength(generationId)>0?AgentRun.RunStatus.INCOMPLETE:AgentRun.RunStatus.FAILED;
+            finishDurably(generationId,status,normalizedReason,message,0,0);return;
+        }
+        RuntimeException exception = new RuntimeException(message);
+        if (!responseFuture.completeExceptionally(exception)) {
+            return;
+        }
+        logger.warn("模型响应异常结束: generationId={}, finishReason={}, message={}",
+                generationId, normalizedReason, message);
+        chatGenerationStateService.markFailed(
+                generationId, message, normalizedReason, false, continuationAttempts);
+        agentContextService.checkpointRun(generationId, AgentRun.RunStatus.FAILED,
+                contextVersion(generationId), 0, 0, normalizedReason,
+                Map.of("error", message, "continuationAttempts", continuationAttempts));
+        handleError(userId, generationId, exception);
+        sendCompletionNotification(userId, generationId, conversationId, true, false,
+                new CompletionOutcome(normalizedReason, false, continuationAttempts));
+        cleanupGenerationState(generationId, exception);
     }
 
     private ExecutedToolResult executeToolForReAct(String userId,
@@ -269,7 +497,11 @@ public class ChatHandler {
                     }
                     : null;
             AgentToolRegistry.ToolExecutionResult toolResult =
-                    agentToolRegistry.executeTool(toolCall.name(), toolCall.arguments(), userId, toolChunkConsumer);
+                    serialToolWithinDeadline(generationId,()->recordedTool(userId,conversationId,generationId,
+                            logicalCalls.containsKey(generationId)?logicalCalls.get(generationId).logicalCallId():generationId,toolCall,
+                            ()->agentToolRegistry.executeTool(toolCall.name(), toolCall.arguments(), userId, toolChunkConsumer)));
+            if(toolResult.retrievalResult()!=null && knowledgeCoordinator!=null)
+                return consumeKnowledgeResult(toolResult,userId,userMessage,generationId,conversationId,toolCall);
 
             // search_knowledge 返回的 SearchResult 列表与模型 prompt 中的 [N] 编号一一对应，
             // 必须把它落到 generationReferenceMappings 里，否则前端点击引用拿不到 MD5/页码。
@@ -282,8 +514,10 @@ public class ChatHandler {
                 content = "工具 " + toolCall.name() + " 执行成功，但没有返回可展示内容。";
             }
             sendToolCallStatus(userId, generationId, conversationId, toolCall, "success");
-            return new ExecutedToolResult(content, toolResult.streamedToUser());
+            return new ExecutedToolResult(content, toolResult.streamedToUser(), toolResult);
         } catch (Exception exception) {
+            if(runFinalizer!=null && !(exception instanceof IllegalArgumentException) && !(exception instanceof SecurityException))
+                throw exception instanceof RuntimeException r?r:new RuntimeException(exception);
             logger.warn("ReAct Agent Tool 执行失败，作为 tool message 返回模型: name={}, generationId={}",
                     toolCall.name(), generationId, exception);
             sendToolCallStatus(userId, generationId, conversationId, toolCall, "failed");
@@ -299,6 +533,68 @@ public class ChatHandler {
             }
             return new ExecutedToolResult("工具 " + toolCall.name() + " 执行失败: " + exception.getMessage(), false);
         }
+    }
+
+    private ExecutedToolResult awaitKnowledgeTool(java.util.concurrent.Future<AgentToolRegistry.ToolExecutionResult> future,
+            String user,String query,String generation,String conversation,LlmProviderRouter.ToolCallDecision call) {
+        long deadline=System.nanoTime()+TimeUnit.SECONDS.toNanos(knowledgeProperties==null?90:Math.max(1,knowledgeProperties.getToolTimeoutSeconds()));
+        if(runFinalizer!=null && runFinalizer.gate(generation)!=null) deadline=Math.min(deadline,runFinalizer.gate(generation).deadline);
+        try {
+            while(true) {
+                if(isGenerationCancelled(generation)) { future.cancel(true);throw new java.util.concurrent.CancellationException(); }
+                if(System.nanoTime()>deadline) { future.cancel(true);throw new TimeoutException("检索超时"); }
+                try { return consumeKnowledgeResult(future.get(200,TimeUnit.MILLISECONDS),user,query,generation,conversation,call); }
+                catch(TimeoutException waiting) { /* Keep checking the existing generation cancellation signal. */ }
+            }
+        } catch(Exception error) {
+            if(runFinalizer!=null) throw new RuntimeException("Tool execution interrupted; result must not be replayed",error);
+            if(error instanceof InterruptedException) Thread.currentThread().interrupt();
+            if(isGenerationCancelled(generation) || error instanceof java.util.concurrent.CancellationException)
+                return new ExecutedToolResult("检索已取消",false);
+            sendToolCallStatus(user,generation,conversation,call,"failed");
+            return new ExecutedToolResult("检索未完成："+error.getClass().getSimpleName(),false);
+        }
+    }
+
+    private AgentToolRegistry.ToolExecutionResult serialToolWithinDeadline(String generation,
+            java.util.function.Supplier<AgentToolRegistry.ToolExecutionResult> action) {
+        if(runFinalizer==null) return action.get();
+        var gate=runFinalizer.gate(generation);
+        if(gate==null || !gate.active()) throw new CancellationException();
+        var future=knowledgeRetrievalExecutor.submit(action::get);
+        var tasks=knowledgeToolFutures.computeIfAbsent(generation,k->new java.util.concurrent.CopyOnWriteArrayList<>());
+        tasks.add(future);
+        try {
+            while(true) {
+                if(!gate.active()) throw new CancellationException("Tool deadline exceeded or generation cancelled");
+                try {return future.get(Math.max(1,Math.min(200,TimeUnit.NANOSECONDS.toMillis(gate.deadline-System.nanoTime()))),TimeUnit.MILLISECONDS);}
+                catch(TimeoutException waiting) { /* Work is bounded by the generation's monotonic deadline. */ }
+            }
+        } catch(InterruptedException e) {Thread.currentThread().interrupt();throw new CancellationException();}
+        catch(ExecutionException e) {var cause=LlmResponseValidator.unwrap(e);throw cause instanceof RuntimeException r?r:new RuntimeException(cause);}
+        finally {future.cancel(true);tasks.remove(future);}
+    }
+
+    private ExecutedToolResult consumeKnowledgeResult(AgentToolRegistry.ToolExecutionResult tool,String user,String query,
+            String generation,String conversation,LlmProviderRouter.ToolCallDecision call) {
+        if(isGenerationCancelled(generation)) return new ExecutedToolResult("检索已取消",false);
+        if(tool.retrievalResult()==null) return new ExecutedToolResult(tool.content(),false,tool);
+        var assembled=knowledgeCoordinator.merge(generation,tool.retrievalResult());
+        knowledgeCoordinator.verify(generation,user);
+        Map<Integer,ReferenceInfo> mapping=new LinkedHashMap<>();
+        knowledgeCoordinator.references(generation).forEach((number,result)->mapping.put(number,buildReferenceInfo(result,result.getFileName(),query)));
+        updateGenerationReferences(generation,mapping);
+        var decorated=new AgentToolRegistry.ToolExecutionResult(tool.toolName(),tool.success(),assembled.text(),Map.of("results",assembled.sources()),false,tool.retrievalResult());
+        sendToolCallStatus(user,generation,conversation,call,tool.success()?"success":"failed");
+        return new ExecutedToolResult(assembled.text(),false,decorated);
+    }
+
+    private void appendFinalKnowledgeEvidence(String generation,String user,List<Map<String,Object>> messages) {
+        knowledgeCoordinator.verify(generation,user);
+        var evidence=knowledgeCoordinator.finalEvidence(generation);
+        Object content=evidence.text();
+        if(deepSeekClient.hasImageResults(evidence.sources())) content=deepSeekClient.buildToolResultContent(evidence.text(),evidence.sources());
+        messages.add(Map.of("role","user","content",content));
     }
 
     private void replaceReferencesFromSearchTool(String generationId,
@@ -326,15 +622,20 @@ public class ChatHandler {
             return;
         }
         // 模型每次 search_knowledge 都会拿到 [1]..[K] 重新编号，因此按"覆盖"语义保存最新一次的引用映射。
-        generationReferenceMappings.put(generationId, mapping);
+        updateGenerationReferences(generationId,mapping);
         chatGenerationStateService.updateReferenceMappings(generationId, toSerializableReferenceMappings(mapping));
         logger.info("ReAct search_knowledge 引用映射已刷新: generationId={}, count={}", generationId, mapping.size());
     }
 
-    private record ExecutedToolResult(String content, boolean streamedToUser) {
+    private record ExecutedToolResult(String content,
+                                      boolean streamedToUser,
+                                      AgentToolRegistry.ToolExecutionResult toolResult) {
+        private ExecutedToolResult(String content, boolean streamedToUser) {
+            this(content, streamedToUser, null);
+        }
     }
 
-    private Map<String, Object> toolMessage(String toolCallId, String content) {
+    private Map<String, Object> toolMessage(String toolCallId, Object content) {
         Map<String, Object> message = new HashMap<>();
         message.put("role", "tool");
         message.put("tool_call_id", toolCallId == null ? "" : toolCallId);
@@ -342,59 +643,239 @@ public class ChatHandler {
         return message;
     }
 
-    private LlmProviderRouter.ReActTurn streamReActTurnBlocking(String userId,
-                                                                String conversationId,
-                                                                String generationId,
-                                                                List<Map<String, Object>> messages,
-                                                                List<AgentToolRegistry.AgentTool> tools) {
-        CompletableFuture<LlmProviderRouter.ReActTurn> turnFuture = new CompletableFuture<>();
-        LlmProviderRouter.StreamHandle streamHandle = llmProviderRouter.streamReActTurn(
-                userId,
-                messages,
-                tools,
-                REACT_MAX_COMPLETION_TOKENS,
-                chunk -> appendStreamChunk(userId, generationId, conversationId, chunk),
-                turnFuture::completeExceptionally,
-                turnFuture::complete
-        );
-        activeStreams.put(generationId, streamHandle);
+    private Object buildToolMessageContent(ExecutedToolResult executedToolResult) {
+        String textContent = executedToolResult == null ? "" : executedToolResult.content();
+        if (executedToolResult == null || executedToolResult.toolResult() == null) {
+            return textContent;
+        }
+        AgentToolRegistry.ToolExecutionResult toolResult = executedToolResult.toolResult();
+        if (toolResult.retrievalResult()==null && !"search_knowledge".equals(toolResult.toolName())) {
+            return textContent;
+        }
 
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(GENERATION_COMPLETION_TIMEOUT_SECONDS);
+        List<SearchResult> results = extractSearchResults(toolResult);
+        if (!deepSeekClient.hasImageResults(results)) {
+            return textContent;
+        }
+
         try {
-            while (true) {
-                if (isGenerationCancelled(generationId)) {
-                    streamHandle.cancel();
-                    return null;
-                }
-                long remainingNanos = deadline - System.nanoTime();
-                if (remainingNanos <= 0) {
-                    streamHandle.cancel();
-                    throw new RuntimeException("模型响应超时，请稍后重试");
-                }
-                try {
-                    long waitMillis = Math.min(TimeUnit.NANOSECONDS.toMillis(remainingNanos), 200L);
-                    return turnFuture.get(Math.max(waitMillis, 1L), TimeUnit.MILLISECONDS);
-                } catch (TimeoutException ignored) {
-                    // 短轮询用于及时响应用户停止生成。
-                }
+            List<Map<String, Object>> multimodalToolContent =
+                    deepSeekClient.buildToolResultContent(textContent, results);
+            if (multimodalToolContent.isEmpty()) {
+                return textContent;
             }
-        } catch (InterruptedException exception) {
-            Thread.currentThread().interrupt();
-            streamHandle.cancel();
-            throw new RuntimeException("模型响应被中断", exception);
-        } catch (ExecutionException exception) {
-            streamHandle.cancel();
-            Throwable cause = exception.getCause() == null ? exception : exception.getCause();
-            if (cause instanceof RuntimeException runtimeException) {
-                throw runtimeException;
-            }
-            throw new RuntimeException("ReAct 流式模型回合调用失败", cause);
-        } finally {
-            activeStreams.remove(generationId, streamHandle);
+            logger.info("已将图片证据写入 search_knowledge tool_result: imageBlocks={}, resultCount={}",
+                    multimodalToolContent.stream().filter(this::isImageContentBlock).count(),
+                    results.size());
+            return multimodalToolContent;
+        } catch (Exception exception) {
+            logger.warn("构造 search_knowledge 多模态 tool_result 失败，降级为文字上下文: {}",
+                    exception.getMessage(), exception);
+            return textContent;
         }
     }
 
+    private List<SearchResult> extractSearchResults(AgentToolRegistry.ToolExecutionResult toolResult) {
+        if (toolResult == null || toolResult.data() == null) {
+            return List.of();
+        }
+        Object resultsObj = toolResult.data().get("results");
+        if (!(resultsObj instanceof List<?> rawList) || rawList.isEmpty()) {
+            return List.of();
+        }
+        List<SearchResult> results = new ArrayList<>();
+        for (Object item : rawList) {
+            if (item instanceof SearchResult result) {
+                results.add(result);
+            } else if (item instanceof Map<?, ?>) {
+                results.add(objectMapper.convertValue(item, SearchResult.class));
+            }
+        }
+        return results;
+    }
+
+    private void appendToolCallContext(String userId, String conversationId, String generationId,
+                                       LlmProviderRouter.ToolCallDecision toolCall) {
+        Map<String, Object> function = new LinkedHashMap<>();
+        function.put("name", toolCall.name());
+        try {
+            function.put("arguments", objectMapper.writeValueAsString(toolCall.arguments()));
+        } catch (JsonProcessingException exception) {
+            function.put("arguments", "{}");
+        }
+        Map<String, Object> serialized = new LinkedHashMap<>();
+        serialized.put("id", toolCall.id());
+        serialized.put("type", "function");
+        serialized.put("function", function);
+        agentContextService.appendEvent(Long.parseLong(userId), conversationId, generationId,
+                ContextEvent.EventType.TOOL_CALL, "assistant", "Tool call: " + toolCall.name(), 80, false,
+                Map.of("tool_calls", List.of(serialized)));
+    }
+
+    private LlmProviderRouter.ReActTurn streamReActTurnBlocking(String userId,String conversationId,String generationId,
+            List<Map<String,Object>> messages,List<AgentToolRegistry.AgentTool> tools) {
+        return streamReActTurnBlocking(userId,conversationId,generationId,messages,tools,false);
+    }
+    private LlmProviderRouter.ReActTurn streamReActTurnBlocking(String userId,String conversationId,String generationId,
+            List<Map<String,Object>> messages,List<AgentToolRegistry.AgentTool> tools,boolean continuation) {
+        if(knowledgeCoordinator!=null) {
+            knowledgeCoordinator.verify(generationId,userId);
+            var bundle=generationContexts.get(generationId);Map<String,Object> request=null;
+            if(bundle!=null) for(var message:bundle.messages()) if("user".equals(message.get("role"))) request=message;
+            agentContextService.fitRound(messages,tools,REACT_MAX_COMPLETION_TOKENS,request);
+        }
+        var gate=runFinalizer==null?null:runFinalizer.gate(generationId);
+        LlmCallContext call=null;
+        if(gate!=null) {
+            var previous=logicalCalls.get(generationId);
+            call=continuation && previous!=null?previous.recovery("continuation"):
+                new LlmCallContext(generationId,null,java.util.UUID.randomUUID().toString(),"chat",continuation,
+                    gate.deadline,gate,gate::active,llmProviderRouter.activeProvider());
+        }
+        int before=responseLength(generationId),recoveries=0;
+        while(true) {
+            if(call!=null) logicalCalls.put(generationId,call);
+            try {return streamReActTurnBlockingOnce(userId,conversationId,generationId,messages,tools,call);}
+            catch(RuntimeException error) {
+                boolean vision=containsImageContent(messages) && LlmResponseValidator.unsupportedVision(error);
+                if(responseLength(generationId)>before || sideEffectGenerations.contains(generationId)
+                    || (!vision && !LlmResponseValidator.retryable(error)) || recoveries++>=2 || (call!=null && !call.valid())) throw error;
+                if(vision){var fallback=withoutImageContent(messages);messages.clear();messages.addAll(fallback);}
+                if(call!=null) call=call.recovery(vision?"vision_fallback":"retry");
+            }
+        }
+    }
+    private LlmProviderRouter.ReActTurn streamReActTurnBlockingOnce(String userId,String conversationId,String generationId,
+            List<Map<String,Object>> messages,List<AgentToolRegistry.AgentTool> tools,LlmCallContext call) {
+        CompletableFuture<LlmProviderRouter.ReActTurn> turnFuture=new CompletableFuture<>();
+        Consumer<String> chunks=chunk->{
+            if(knowledgeCoordinator==null || tools.isEmpty()) {
+                if(knowledgeCoordinator!=null) knowledgeCoordinator.verify(generationId,userId);
+                appendStreamChunk(userId,generationId,conversationId,chunk);
+            }
+        };
+        var stream=call==null?llmProviderRouter.streamReActTurn(userId,messages,tools,REACT_MAX_COMPLETION_TOKENS,chunks,turnFuture::completeExceptionally,turnFuture::complete):
+            llmProviderRouter.streamReActTurn(userId,messages,tools,REACT_MAX_COMPLETION_TOKENS,chunks,turnFuture::completeExceptionally,turnFuture::complete,call);
+        activeStreams.put(generationId,stream);
+        long deadline=call==null?System.nanoTime()+TimeUnit.SECONDS.toNanos(GENERATION_COMPLETION_TIMEOUT_SECONDS):call.deadlineNanos();
+        try {
+            while(true) {
+                if(isGenerationCancelled(generationId)) {stream.cancel();finishCancelledGeneration(generationId,responseFutures.get(generationId),responseBuilders.get(generationId));return null;}
+                long remaining=deadline-System.nanoTime();
+                if(remaining<=0){stream.cancel();throw new LlmResponseValidator.Failure(LlmResponseValidator.Kind.TIMEOUT,"Generation deadline exceeded");}
+                try{return turnFuture.get(Math.max(1,Math.min(200,TimeUnit.NANOSECONDS.toMillis(remaining))),TimeUnit.MILLISECONDS);}
+                catch(TimeoutException ignored){}
+            }
+        } catch(InterruptedException e){Thread.currentThread().interrupt();stream.cancel();throw new java.util.concurrent.CancellationException();}
+        catch(ExecutionException e){stream.cancel();Throwable cause=LlmResponseValidator.unwrap(e);throw cause instanceof RuntimeException r?r:new RuntimeException(cause);}
+        finally{activeStreams.remove(generationId,stream);}
+    }
+    private int responseLength(String generationId) {
+        StringBuilder responseBuilder = responseBuilders.get(generationId);
+        return responseBuilder == null ? 0 : responseBuilder.length();
+    }
+
+    private AgentToolRegistry.ToolExecutionResult recordedTool(String user,String conversation,String generation,String logical,
+            LlmProviderRouter.ToolCallDecision call,java.util.function.Supplier<AgentToolRegistry.ToolExecutionResult> action) {
+        if(runFinalizer==null) return action.get();
+        var gate=runFinalizer.gate(generation);
+        if(gate==null || !gate.active()) throw new java.util.concurrent.CancellationException();
+        if("submit_feedback".equals(call.name())) sideEffectGenerations.add(generation);
+        return agentContextService.executeRecordedTool(Long.valueOf(user),conversation,generation,logical,call,action);
+    }
+    private void failDurably(String generation,Throwable error) {
+        Throwable cause=LlmResponseValidator.unwrap(error);
+        AgentRun.RunStatus status=cause instanceof LlmResponseValidator.Failure failure && failure.kind()==LlmResponseValidator.Kind.REJECTED
+                ?AgentRun.RunStatus.REJECTED:responseLength(generation)>0?AgentRun.RunStatus.INCOMPLETE:AgentRun.RunStatus.FAILED;
+        String reason=cause instanceof LlmResponseValidator.Failure failure?failure.reason():cause.getClass().getSimpleName();
+        finishDurably(generation,status,reason,status==AgentRun.RunStatus.INCOMPLETE?"回答已中断，已保留收到的内容":"模型请求未完成",0,0);
+    }
+    private void updateGenerationReferences(String generation,Map<Integer,ReferenceInfo> mapping) {
+        Object gate=runFinalizer==null?this:runFinalizer.gate(generation);
+        if(gate==null)return;
+        synchronized(gate) {
+            if(gate instanceof ChatRunFinalizer.Gate control && (control.frozen || control.cancelled)) return;
+            generationReferenceMappings.put(generation,mapping);
+            chatGenerationStateService.updateReferenceMappings(generation,toSerializableReferenceMappings(mapping));
+        }
+    }
+    private void finishDurably(String generation,AgentRun.RunStatus status,String reason,String diagnostic,int prompt,int completion) {
+        GenerationRequest request=generationRequests.get(generation);
+        var gate=runFinalizer.gate(generation);
+        if(request==null || gate==null) return;
+        runFinalizer.submit(generation,()->new ChatRunFinalizer.Intent(generation,java.util.UUID.randomUUID().toString(),request.user(),request.conversation(),
+                request.question(),responseBuilders.containsKey(generation)?responseBuilders.get(generation).toString():"",
+                toSerializableReferenceMappings(generationReferenceMappings.get(generation)),gate.cancelled?AgentRun.RunStatus.CANCELLED:status,
+                gate.cancelled?"cancelled":normalizeFinishReason(reason),prompt,completion,gate.sequence,System.currentTimeMillis(),diagnostic),
+                intent->{
+                    var future=responseFutures.get(generation);
+                    if(future!=null) {
+                        if(intent.status()==AgentRun.RunStatus.FAILED || intent.status()==AgentRun.RunStatus.REJECTED)
+                            future.completeExceptionally(new IllegalStateException(intent.diagnostic()==null?intent.finishReason():intent.diagnostic()));
+                        else future.complete(intent.answer());
+                    }
+                    cleanupGenerationState(generation,null);
+                });
+    }
+
+    private boolean containsImageContent(List<Map<String, Object>> messages) {
+        if (messages == null || messages.isEmpty()) {
+            return false;
+        }
+        return messages.stream()
+                .map(message -> message.get("content"))
+                .anyMatch(content -> content instanceof List<?> blocks
+                        && blocks.stream().anyMatch(block -> block instanceof Map<?, ?> map && isImageContentBlock(map)));
+    }
+
+    private List<Map<String, Object>> withoutImageContent(List<Map<String, Object>> messages) {
+        if (messages == null || messages.isEmpty()) {
+            return List.of();
+        }
+        List<Map<String, Object>> fallbackMessages = new ArrayList<>(messages.size());
+        for (Map<String, Object> message : messages) {
+            Map<String, Object> copied = new LinkedHashMap<>(message);
+            Object content = copied.get("content");
+            if (content instanceof List<?> blocks) {
+                StringBuilder textOnly = new StringBuilder();
+                for (Object block : blocks) {
+                    if (!(block instanceof Map<?, ?> map)) {
+                        continue;
+                    }
+                    if (isImageContentBlock(map)) {
+                        continue;
+                    }
+                    Object type = map.get("type");
+                    Object text = map.get("text");
+                    if ("text".equals(String.valueOf(type)) && text != null) {
+                        textOnly.append(text).append("\n\n");
+                    }
+                }
+                copied.put("content", textOnly.toString().trim());
+            }
+            fallbackMessages.add(copied);
+        }
+        return fallbackMessages;
+    }
+
+    private boolean isImageContentBlock(Map<?, ?> block) {
+        return "image_url".equals(String.valueOf(block.get("type")));
+    }
+
     private void appendStreamChunk(String userId, String generationId, String conversationId, String chunk) {
+        if(runFinalizer!=null) {
+            var gate=runFinalizer.gate(generationId);
+            if(gate==null) return;
+            synchronized(gate) {
+                if(gate.frozen || gate.cancelled || chunk==null || chunk.isEmpty()) return;
+                StringBuilder body=responseBuilders.get(generationId);if(body==null)return;
+                body.append(chunk);long sequence=++gate.sequence;
+                try {chatGenerationStateService.appendChunk(generationId,chunk);}catch(RuntimeException e){logger.warn("Streaming projection unavailable: generation={}",generationId);}
+                chatSessionRegistry.sendJsonToGeneration(generationId,Map.of("type","chunk","generationId",generationId,
+                        "conversationId",conversationId,"chunk",chunk,"sequence",sequence));
+            }
+            return;
+        }
         if (chunk == null || chunk.isEmpty() || isGenerationCancelled(generationId)) {
             return;
         }
@@ -452,6 +933,22 @@ public class ChatHandler {
                                   CompletableFuture<String> responseFuture,
                                   StringBuilder responseBuilder,
                                   LlmProviderRouter.StreamCompletion completion) {
+        String finishReason = completion == null ? "unknown" : normalizeFinishReason(completion.finishReason());
+        finalizeResponse(userId, userMessage, conversationId, generationId, responseFuture,
+                responseBuilder, completion, new CompletionOutcome(finishReason, false, 0));
+    }
+
+    private void finalizeResponse(String userId, String userMessage, String conversationId, String generationId,
+                                  CompletableFuture<String> responseFuture,
+                                  StringBuilder responseBuilder,
+                                  LlmProviderRouter.StreamCompletion completion,
+                                  CompletionOutcome outcome) {
+        if(runFinalizer!=null) {
+            boolean empty=responseBuilder==null || responseBuilder.toString().isBlank();
+            finishDurably(generationId,empty?AgentRun.RunStatus.FAILED:outcome.truncated()?AgentRun.RunStatus.INCOMPLETE:AgentRun.RunStatus.COMPLETED,
+                    outcome.finishReason(),empty?"模型未返回有效内容":null,completion==null?0:completion.promptTokens(),completion==null?0:completion.completionTokens());
+            return;
+        }
         if (finishCancelledGeneration(generationId, responseFuture, responseBuilder)) {
             return;
         }
@@ -499,8 +996,27 @@ public class ChatHandler {
             logger.warn("MySQL 落库失败，跳过 Redis 会话历史写入以保持两端一致: generationId={}, conversationId={}",
                     generationId, conversationId);
         }
-        chatGenerationStateService.markCompleted(generationId, toSerializableReferenceMappings(referenceMappings));
-        sendCompletionNotification(userId, generationId, conversationId, false, !persisted);
+        chatGenerationStateService.markCompleted(
+                generationId,
+                toSerializableReferenceMappings(referenceMappings),
+                outcome.finishReason(),
+                outcome.truncated(),
+                outcome.continuationAttempts()
+        );
+        AgentContextService.ContextBundle contextBundle = generationContexts.get(generationId);
+        try {
+            agentContextService.appendEvent(Long.parseLong(userId), conversationId, generationId,
+                    ContextEvent.EventType.MESSAGE, "assistant", completeResponse, 90, false,
+                    Map.of("finishReason", outcome.finishReason(), "truncated", outcome.truncated()));
+            agentContextService.checkpointRun(generationId, AgentRun.RunStatus.COMPLETED,
+                    contextBundle == null ? 0 : contextBundle.snapshotVersion(),
+                    completion == null ? 0 : completion.promptTokens(),
+                    completion == null ? 0 : completion.completionTokens(), outcome.finishReason(),
+                    Map.of("truncated", outcome.truncated(), "continuationAttempts", outcome.continuationAttempts()));
+        } catch (Exception contextException) {
+            logger.error("Context event persistence failed: generationId={}", generationId, contextException);
+        }
+        sendCompletionNotification(userId, generationId, conversationId, false, !persisted, outcome);
         logger.info("对话存储信息 - Redis键: {}, 值: {}", "user:" + userId + ":current_conversation", conversationId);
         cleanupGenerationState(generationId, null);
         logger.info("消息处理完成，用户ID: {}", userId);
@@ -525,8 +1041,19 @@ public class ChatHandler {
     }
 
     private void cleanupGenerationState(String generationId, Throwable throwable) {
+        if(runFinalizer!=null && runFinalizer.pending(generationId)) return;
+        var pending=knowledgeToolFutures.remove(generationId);
+        if(pending!=null) pending.forEach(future->future.cancel(true));
+        if(knowledgeCoordinator!=null) knowledgeCoordinator.close(generationId);
+        if (throwable != null && runFinalizer==null) {
+            agentContextService.checkpointRun(generationId, AgentRun.RunStatus.FAILED,
+                    contextVersion(generationId), 0, 0, "error",
+                    Map.of("error", throwable.getMessage() == null ? throwable.getClass().getSimpleName() : throwable.getMessage()));
+        }
         responseBuilders.remove(generationId);
         generationReferenceMappings.remove(generationId);
+        generationContexts.remove(generationId);
+        generationRequests.remove(generationId);logicalCalls.remove(generationId);sideEffectGenerations.remove(generationId);
         stopFlags.remove(generationId);
         activeStreams.remove(generationId);
         cancelledGenerations.remove(generationId);
@@ -534,6 +1061,7 @@ public class ChatHandler {
         if (throwable != null && future != null && !future.isDone()) {
             future.completeExceptionally(throwable);
         }
+        chatSessionRegistry.unbindGeneration(generationId);
     }
 
     private boolean finishCancelledGeneration(String generationId,
@@ -542,10 +1070,13 @@ public class ChatHandler {
         if (!isGenerationCancelled(generationId)) {
             return false;
         }
+        if(runFinalizer!=null) {finishDurably(generationId,AgentRun.RunStatus.CANCELLED,"cancelled",null,0,0);return true;}
 
         if (!responseFuture.isDone()) {
             responseFuture.complete(responseBuilder != null ? responseBuilder.toString() : "");
         }
+        agentContextService.checkpointRun(generationId, AgentRun.RunStatus.CANCELLED,
+                contextVersion(generationId), 0, 0, "cancelled", Map.of());
         cleanupGenerationState(generationId, null);
         logger.info("生成任务已取消并停止后续收尾逻辑: generationId={}", generationId);
         return true;
@@ -702,6 +1233,20 @@ public class ChatHandler {
             item.put("evidenceSnippet", detail.evidenceSnippet());
             item.put("score", detail.score());
             item.put("chunkId", detail.chunkId());
+            item.put("itemId", detail.itemId());
+            item.put("knowledgeType", detail.knowledgeType());
+            item.put("searchText", detail.searchText());
+            item.put("imageText", detail.imageText());
+            item.put("imageSourceType", detail.imageSourceType());
+            item.put("imageUrl", detail.imageUrl());
+            item.put("bucketName", detail.bucketName());
+            item.put("objectName", detail.objectName());
+            item.put("embeddedImageId", detail.embeddedImageId());
+            item.put("imageSequence", detail.imageSequence());
+            item.put("contentType", detail.contentType());
+            item.put("width", detail.width());
+            item.put("height", detail.height());
+            item.put("sourceId",detail.sourceId());item.put("documentId",detail.documentId());item.put("chunkSetId",detail.chunkSetId());
             serialized.put(String.valueOf(entry.getKey()), item);
         }
         return serialized;
@@ -719,7 +1264,7 @@ public class ChatHandler {
         StringBuilder context = new StringBuilder();
         for (int i = 0; i < searchResults.size(); i++) {
             SearchResult result = searchResults.get(i);
-            String snippet = result.getTextContent();
+            String snippet = result.getTextContent() == null ? "" : result.getTextContent();
             if (snippet.length() > MAX_CONTEXT_SNIPPET_LEN) {
                 snippet = snippet.substring(0, MAX_CONTEXT_SNIPPET_LEN) + "…";
             }
@@ -729,7 +1274,10 @@ public class ChatHandler {
             // 格式：[1] (test1.txt | 第5页) 文件内容... 或 [1] (test1.txt) 文件内容...
             // 有页码时显示页码，方便AI引用
             Integer pageNum = result.getPageNumber();
-            if (pageNum != null && pageNum > 0) {
+            if (pageNum != null && pageNum > 0 && result.getImageSequence() != null) {
+                context.append(String.format("[%d] (%s | 第%d页 | 第%d张图片) %s\n",
+                        i + 1, fileLabel, pageNum, result.getImageSequence(), snippet));
+            } else if (pageNum != null && pageNum > 0) {
                 context.append(String.format("[%d] (%s | 第%d页) %s\n", i + 1, fileLabel, pageNum, snippet));
             } else {
                 context.append(String.format("[%d] (%s) %s\n", i + 1, fileLabel, snippet));
@@ -753,13 +1301,15 @@ public class ChatHandler {
         return context.toString();
     }
 
-    private void sendGenerationStart(String userId, String generationId, String conversationId) {
-        chatSessionRegistry.sendJsonToUser(userId, Map.of(
-                "type", "start",
-                "generationId", generationId,
-                "conversationId", conversationId,
-                "timestamp", System.currentTimeMillis()
-        ));
+    private void sendGenerationStart(String userId, String generationId, String conversationId,
+                                     AgentContextService.ContextBundle context) {
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("type", "start");
+        payload.put("generationId", generationId);
+        payload.put("conversationId", conversationId);
+        payload.put("timestamp", System.currentTimeMillis());
+        addContextMetadata(payload, context);
+        chatSessionRegistry.sendJsonToGeneration(generationId, payload);
     }
 
     private void sendResponseChunk(String userId, String generationId, String conversationId, String chunk) {
@@ -768,7 +1318,7 @@ public class ChatHandler {
             return;
         }
 
-        chatSessionRegistry.sendJsonToUser(userId, Map.of(
+        chatSessionRegistry.sendJsonToGeneration(generationId, Map.of(
                 "type", "chunk",
                 "generationId", generationId,
                 "conversationId", conversationId,
@@ -789,7 +1339,7 @@ public class ChatHandler {
         payload.put("generationId", generationId);
         payload.put("conversationId", conversationId);
         payload.put("timestamp", System.currentTimeMillis());
-        chatSessionRegistry.sendJsonToUser(userId, payload);
+        chatSessionRegistry.sendJsonToGeneration(generationId, payload);
     }
 
     private void sendCompletionNotification(String userId,
@@ -797,6 +1347,16 @@ public class ChatHandler {
                                             String conversationId,
                                             boolean failed,
                                             boolean persistenceDegraded) {
+        sendCompletionNotification(userId, generationId, conversationId, failed, persistenceDegraded,
+                new CompletionOutcome("unknown", false, 0));
+    }
+
+    private void sendCompletionNotification(String userId,
+                                            String generationId,
+                                            String conversationId,
+                                            boolean failed,
+                                            boolean persistenceDegraded,
+                                            CompletionOutcome outcome) {
         Map<String, Object> notification = new HashMap<>();
         notification.put("type", "completion");
         notification.put("generationId", generationId);
@@ -805,6 +1365,10 @@ public class ChatHandler {
         notification.put("message", failed ? "响应已中断" : "响应已完成");
         notification.put("timestamp", System.currentTimeMillis());
         notification.put("date", java.time.LocalDateTime.now().toString());
+        notification.put("finishReason", outcome.finishReason());
+        notification.put("truncated", outcome.truncated());
+        notification.put("continuationAttempts", outcome.continuationAttempts());
+        addContextMetadata(notification, generationContexts.get(generationId));
         if (!failed) {
             Map<Integer, ReferenceInfo> referenceMappings = generationReferenceMappings.get(generationId);
             if (referenceMappings != null && !referenceMappings.isEmpty()) {
@@ -815,7 +1379,53 @@ public class ChatHandler {
             notification.put("persistenceDegraded", true);
             notification.put("persistenceWarning", "本次回复未能持久化到数据库，刷新后可能无法在历史中找到。");
         }
-        chatSessionRegistry.sendJsonToUser(userId, notification);
+        chatSessionRegistry.sendJsonToGeneration(generationId, notification);
+    }
+
+    private void addContextMetadata(Map<String, Object> payload, AgentContextService.ContextBundle context) {
+        if (context == null) return;
+        payload.put("contextWindowTokens", context.contextWindowTokens());
+        payload.put("contextUsedTokens", context.usedTokens());
+        payload.put("contextUsageRatio", context.usageRatio());
+        payload.put("snapshotVersion", context.snapshotVersion());
+        payload.put("contextDegraded", context.degraded());
+    }
+
+    static FinishReasonKind classifyFinishReason(String finishReason) {
+        return switch (normalizeFinishReason(finishReason)) {
+            case "stop", "end_turn", "completed", "tool_streamed" -> FinishReasonKind.NORMAL;
+            case "length", "max_tokens", "max_output_tokens" -> FinishReasonKind.LENGTH;
+            case "content_filter", "safety", "blocked" -> FinishReasonKind.SAFETY;
+            case "tool_calls", "function_call" -> FinishReasonKind.TOOL;
+            default -> FinishReasonKind.UNKNOWN;
+        };
+    }
+
+    static String normalizeFinishReason(String finishReason) {
+        if (finishReason == null || finishReason.isBlank()) {
+            return "unknown";
+        }
+        return finishReason.trim().toLowerCase(Locale.ROOT);
+    }
+
+    enum FinishReasonKind {
+        NORMAL,
+        LENGTH,
+        SAFETY,
+        TOOL,
+        UNKNOWN
+    }
+
+    private record CompletionOutcome(String finishReason, boolean truncated, int continuationAttempts) {
+        private CompletionOutcome {
+            finishReason = normalizeFinishReason(finishReason);
+            continuationAttempts = Math.max(continuationAttempts, 0);
+        }
+    }
+
+    private long contextVersion(String generationId) {
+        AgentContextService.ContextBundle context = generationContexts.get(generationId);
+        return context == null ? 0 : context.snapshotVersion();
     }
 
     private void handleError(String userId, String generationId, Throwable error) {
@@ -824,17 +1434,21 @@ public class ChatHandler {
         errorResponse.put("type", "error");
         errorResponse.put("generationId", generationId);
         errorResponse.put("error", "AI服务暂时不可用，请稍后重试");
-        chatSessionRegistry.sendJsonToUser(userId, errorResponse);
+        if (generationId == null) {
+            chatSessionRegistry.sendJsonToUser(userId, errorResponse);
+        } else {
+            chatSessionRegistry.sendJsonToGeneration(generationId, errorResponse);
+        }
     }
 
-    private void sendRateLimitMessage(String userId, String generationId, RateLimitExceededException exception) {
+    private void sendRateLimitMessage(WebSocketSession session, RateLimitExceededException exception) {
         Map<String, Object> payload = new HashMap<>();
         payload.put("type", "error");
-        payload.put("generationId", generationId);
+        payload.put("generationId", null);
         payload.put("code", 429);
         payload.put("message", exception.getMessage());
         payload.put("retryAfterSeconds", exception.getRetryAfterSeconds());
-        chatSessionRegistry.sendJsonToUser(userId, payload);
+        chatSessionRegistry.sendJsonToSession(session, payload);
     }
 
     /**
@@ -853,6 +1467,14 @@ public class ChatHandler {
             return;
         }
         final String targetGenerationId = resolvedGenerationId;
+        if(runFinalizer!=null) {
+            var request=generationRequests.get(targetGenerationId);var gate=runFinalizer.gate(targetGenerationId);
+            if(request==null || !request.user().equals(userId) || gate==null)return;
+            synchronized(gate) {if(gate.frozen)return;gate.cancelled=true;cancelledGenerations.add(targetGenerationId);stopFlags.put(targetGenerationId,true);}
+            var stream=activeStreams.get(targetGenerationId);if(stream!=null)stream.cancel();
+            var pending=knowledgeToolFutures.get(targetGenerationId);if(pending!=null)pending.forEach(task->task.cancel(true));
+            finishDurably(targetGenerationId,AgentRun.RunStatus.CANCELLED,"cancelled",null,0,0);return;
+        }
 
         logger.info("收到停止请求，用户ID: {}，generationId: {}", userId, targetGenerationId);
 
@@ -869,7 +1491,7 @@ public class ChatHandler {
             responseFuture.completeExceptionally(new CancellationException("响应已停止"));
         }
 
-        chatSessionRegistry.sendJsonToUser(userId, Map.of(
+        chatSessionRegistry.sendJsonToGeneration(targetGenerationId, Map.of(
                 "type", "stop",
                 "generationId", targetGenerationId,
                 "message", "响应已停止",
@@ -935,11 +1557,34 @@ public class ChatHandler {
                     (String) item.get("retrievalQuery"),
                     (String) item.get("matchedChunkText"),
                     (String) item.get("evidenceSnippet"),
-                    item.get("score") instanceof Number number ? number.doubleValue() : null,
-                    item.get("chunkId") instanceof Number number ? number.intValue() : null
+                    asDouble(item.get("score")),
+                    asInteger(item.get("chunkId")),
+                    (String) item.get("itemId"),
+                    (String) item.get("knowledgeType"),
+                    (String) item.get("searchText"),
+                    (String) item.get("imageText"),
+                    (String) item.get("imageSourceType"),
+                    (String) item.get("imageUrl"),
+                    (String) item.get("bucketName"),
+                    (String) item.get("objectName"),
+                    (String) item.get("embeddedImageId"),
+                    asInteger(item.get("imageSequence")),
+                    (String) item.get("contentType"),
+                    asInteger(item.get("width")),
+                    asInteger(item.get("height")),
+                    (String)item.get("sourceId"),item.get("documentId") instanceof Number documentId?documentId.longValue():null,
+                    item.get("chunkSetId") instanceof Number chunkSetId?chunkSetId.longValue():null
             ));
         }
         return referenceMap;
+    }
+
+    private Integer asInteger(Object value) {
+        return value instanceof Number number ? number.intValue() : null;
+    }
+
+    private Double asDouble(Object value) {
+        return value instanceof Number number ? number.doubleValue() : null;
     }
 
     private ReferenceInfo buildReferenceInfo(SearchResult result, String fileLabel, String userMessage) {
@@ -960,7 +1605,20 @@ public class ChatHandler {
                 matchedChunkText,
                 evidenceSnippet,
                 result.getScore(),
-                result.getChunkId()
+                result.getChunkId(),
+                result.getItemId(),
+                result.getKnowledgeType(),
+                result.getSearchText(),
+                result.getImageText(),
+                result.getImageSourceType(),
+                result.getImageUrl(),
+                result.getBucketName(),
+                result.getObjectName(),
+                result.getEmbeddedImageId(),
+                result.getImageSequence(),
+                result.getContentType(),
+                result.getWidth(),
+                result.getHeight(),result.getSourceId(),result.getDocumentId(),result.getChunkSetId()
         );
     }
 
@@ -968,6 +1626,13 @@ public class ChatHandler {
         if ("TEXT_ONLY".equalsIgnoreCase(retrievalMode)) {
             return "关键词召回";
         }
+        if ("MULTIMODAL_TEXT_ONLY".equalsIgnoreCase(retrievalMode)) {
+            return "多模态关键词召回";
+        }
+        if ("MULTIMODAL_HYBRID".equalsIgnoreCase(retrievalMode)) {
+            return "多模态召回（图文语义 + 关键词）";
+        }
+        if ("KNOWLEDGE_EVIDENCE".equals(retrievalMode)) return "多索引证据（原文/图片与图谱来源）";
         return "混合召回（语义相关 + 关键词命中）";
     }
 
@@ -1020,8 +1685,29 @@ public class ChatHandler {
             String matchedChunkText,
             String evidenceSnippet,
             Double score,
-            Integer chunkId
+            Integer chunkId,
+            String itemId,
+            String knowledgeType,
+            String searchText,
+            String imageText,
+            String imageSourceType,
+            String imageUrl,
+            String bucketName,
+            String objectName,
+            String embeddedImageId,
+            Integer imageSequence,
+            String contentType,
+            Integer width,
+            Integer height,
+            String sourceId,
+            Long documentId,
+            Long chunkSetId
     ) {
+        public ReferenceInfo(String fileMd5,String fileName,Integer pageNumber,String anchorText,String retrievalMode,String retrievalLabel,String retrievalQuery,
+                String matchedChunkText,String evidenceSnippet,Double score,Integer chunkId,String itemId,String knowledgeType,String searchText,String imageText,
+                String imageSourceType,String imageUrl,String bucketName,String objectName,String embeddedImageId,Integer imageSequence,String contentType,Integer width,Integer height) {
+            this(fileMd5,fileName,pageNumber,anchorText,retrievalMode,retrievalLabel,retrievalQuery,matchedChunkText,evidenceSnippet,score,chunkId,itemId,knowledgeType,searchText,imageText,imageSourceType,imageUrl,bucketName,objectName,embeddedImageId,imageSequence,contentType,width,height,null,null,null);
+        }
     }
 
 }

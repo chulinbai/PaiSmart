@@ -23,10 +23,12 @@ public class Conversation {
     @JoinColumn(name = "user_id", nullable = false)
     private User user; // 关联用户
 
-    @Column(nullable = false, columnDefinition = "TEXT")
+    @Lob
+    @Column(nullable = false, columnDefinition = "LONGTEXT")
     private String question; // 用户提问内容
 
-    @Column(nullable = false, columnDefinition = "TEXT")
+    @Lob
+    @Column(nullable = false, columnDefinition = "LONGTEXT")
     private String answer; // 系统回答内容
 
     @Column(name = "conversation_id", length = 64)
@@ -34,6 +36,10 @@ public class Conversation {
 
     @Column(name = "reference_mappings_json", columnDefinition = "LONGTEXT")
     private String referenceMappingsJson; // 助手回复对应的引用映射
+    @Column(name="generation_id",unique=true,length=64) private String generationId;
+    @Column(length=24) private String answerStatus;
+    @Column(length=64) private String finishReason;
+    @Column(columnDefinition="LONGTEXT") private String responseMetadataJson;
 
     @CreationTimestamp
     private LocalDateTime timestamp; // 对话时间戳

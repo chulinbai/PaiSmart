@@ -207,6 +207,11 @@ public class UploadService {
                 return "GIF图片";
             case "bmp":
                 return "BMP图片";
+            case "webp":
+                return "WebP图片";
+            case "tif":
+            case "tiff":
+                return "TIFF图片";
             case "svg":
                 return "SVG图片";
             case "mp4":

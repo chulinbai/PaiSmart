@@ -14,7 +14,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
-import org.springframework.stereotype.Service;
 import co.elastic.clients.elasticsearch._types.query_dsl.Operator;
 
 import java.util.Collections;
@@ -28,7 +27,6 @@ import java.util.stream.Collectors;
  * 混合搜索服务，结合文本匹配和向量相似度搜索
  * 支持权限过滤，确保用户只能搜索其有权限访问的文档
  */
-@Service
 public class HybridSearchService {
 
     private static final Logger logger = LoggerFactory.getLogger(HybridSearchService.class);

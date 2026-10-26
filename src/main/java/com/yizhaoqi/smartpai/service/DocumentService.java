@@ -47,6 +47,7 @@ import java.util.stream.Collectors;
 public class DocumentService {
 
     public record PdfSinglePagePreview(byte[] content, boolean cacheHit) {}
+    public record PdfEmbeddedImagePreview(byte[] content, String contentType) {}
     private record InMemoryPdfPreviewCache(byte[] content, long expiresAtMillis) {}
 
     private static final Logger logger = LoggerFactory.getLogger(DocumentService.class);
@@ -88,13 +89,25 @@ public class DocumentService {
     private ParseService parseService;
 
     @Autowired
-    private VectorizationService vectorizationService;
+    private MultimodalVectorizationService multimodalVectorizationService;
+
+    @Autowired
+    private FileTypeValidationService fileTypeValidationService;
+
+    @Autowired
+    private PdfImageExtractionService pdfImageExtractionService;
 
     @Autowired
     private KafkaTemplate<String, Object> kafkaTemplate;
 
     @Autowired
     private KafkaConfig kafkaConfig;
+    @Autowired(required=false)
+    private com.yizhaoqi.smartpai.service.knowledge.KnowledgeIndexOrchestrator knowledgeIndexes;
+    @Autowired
+    private org.springframework.jdbc.core.JdbcTemplate knowledgeJdbc;
+    @Autowired
+    private com.yizhaoqi.smartpai.service.knowledge.KnowledgeAccessService knowledgeAccess;
 
     /**
      * 删除文档及其相关数据
@@ -106,7 +119,7 @@ public class DocumentService {
      *
      * @param fileMd5 文件MD5
      */
-    @Transactional
+    @Transactional(isolation=org.springframework.transaction.annotation.Isolation.READ_COMMITTED)
     public void deleteDocument(String fileMd5, String userId) {
         logger.info("开始删除文档: {}", fileMd5);
         
@@ -114,6 +127,15 @@ public class DocumentService {
             // 获取文件信息以获取文件名
             FileUpload fileUpload = fileUploadRepository.findFirstByFileMd5AndUserIdOrderByCreatedAtDesc(fileMd5, userId)
                     .orElseThrow(() -> new RuntimeException("文件不存在"));
+            // Lock the MD5 range before checking physical ownership. Deleting one upload never deletes another user's row.
+            var owners=knowledgeJdbc.queryForList("SELECT id FROM file_upload WHERE file_md5=? ORDER BY id FOR UPDATE",Long.class,fileMd5);
+            if(knowledgeIndexes!=null) knowledgeIndexes.withdraw(fileUpload.getId(),fileUpload.getUserId());
+            if(owners.size()>1) {
+                elasticsearchService.deleteByFileMd5AndUserId(fileMd5,userId);
+                multimodalVectorizationService.deleteByFileMd5AndUserId(fileMd5,userId);
+                fileUploadRepository.deleteByFileMd5AndUserId(fileMd5,userId);
+                return;
+            }
             
             // 1. 删除Elasticsearch中的数据
             try {
@@ -121,6 +143,14 @@ public class DocumentService {
                 logger.info("成功从Elasticsearch删除文档: {}", fileMd5);
             } catch (Exception e) {
                 logger.error("从Elasticsearch删除文档时出错: {}", fileMd5, e);
+                // 继续删除其他数据
+            }
+
+            try {
+                multimodalVectorizationService.deleteByFileMd5(fileMd5);
+                logger.info("成功删除多模态知识项: {}", fileMd5);
+            } catch (Exception e) {
+                logger.error("删除多模态知识项时出错: {}", fileMd5, e);
                 // 继续删除其他数据
             }
             
@@ -173,7 +203,7 @@ public class DocumentService {
             }
             
             // 4. 删除FileUpload记录
-            fileUploadRepository.deleteByFileMd5(fileMd5);
+            fileUploadRepository.deleteByFileMd5AndUserId(fileMd5,userId);
             logger.info("成功删除文件上传记录: {}", fileMd5);
             
             logger.info("文档删除完成: {}", fileMd5);
@@ -183,41 +213,70 @@ public class DocumentService {
         }
     }
 
-    @Transactional
-    public VectorizationService.VectorizationUsageResult reindexDocument(String fileMd5, String requesterId) {
+    public VectorizationUsageResult reindexDocument(String fileMd5, String requesterId) {
         logger.info("开始重建文档索引: fileMd5={}, requesterId={}", fileMd5, requesterId);
 
-        FileUpload fileUpload = fileUploadRepository.findFirstByFileMd5OrderByCreatedAtDesc(fileMd5)
+        FileUpload fileUpload = fileUploadRepository.findFirstByFileMd5AndUserIdOrderByCreatedAtDesc(fileMd5,requesterId)
                 .orElseThrow(() -> new RuntimeException("文件不存在"));
+
+        if(knowledgeIndexes!=null) {
+            enqueueAsyncVectorizationRetry(fileMd5,requesterId);
+            return new VectorizationUsageResult(0,0,"knowledge:queued");
+        }
 
         markVectorizationProcessing(fileUpload, true);
 
         try (InputStream fileStream = uploadService.getMergedFileStream(fileMd5)) {
             try {
-                elasticsearchService.deleteByFileMd5(fileMd5);
+                elasticsearchService.deleteByFileMd5AndUserId(fileMd5,requesterId);
                 logger.info("重建前已清理 Elasticsearch 文档: {}", fileMd5);
             } catch (Exception e) {
                 logger.warn("重建前清理 Elasticsearch 失败: fileMd5={}, error={}", fileMd5, e.getMessage());
             }
 
-            documentVectorRepository.deleteByFileMd5(fileMd5);
+            try {
+                multimodalVectorizationService.deleteByFileMd5AndUserId(fileMd5,requesterId);
+                logger.info("重建前已清理多模态索引与元数据: {}", fileMd5);
+            } catch (Exception e) {
+                logger.warn("重建前清理多模态索引失败: fileMd5={}, error={}", fileMd5, e.getMessage());
+            }
+
+            boolean shared=fileUploadRepository.countByFileMd5(fileMd5)>1;
+            if(!shared) documentVectorRepository.deleteByFileMd5(fileMd5);
             invalidatePdfSinglePagePreviewCache(fileMd5);
 
-            parseService.parseAndSave(
-                    fileMd5,
-                    fileStream,
-                    fileUpload.getUserId(),
-                    fileUpload.getOrgTag(),
-                    fileUpload.isPublic()
-            );
+            VectorizationUsageResult result;
+            if (fileTypeValidationService.isSupportedImageFileName(fileUpload.getFileName())) {
+                MultimodalVectorizationService.MultimodalVectorizationResult multimodalResult =
+                        multimodalVectorizationService.indexFile(
+                                fileMd5,
+                                fileUpload.getFileName(),
+                                fileUpload.getUserId(),
+                                fileUpload.getOrgTag(),
+                                fileUpload.isPublic(),
+                                requesterId
+                        );
+                result = toVectorizationUsageResult(multimodalResult);
+            } else {
+                if(!shared || documentVectorRepository.countByFileMd5(fileMd5)==0) parseService.parseAndSave(
+                        fileMd5,
+                        fileStream,
+                        fileUpload.getUserId(),
+                        fileUpload.getOrgTag(),
+                        fileUpload.isPublic()
+                );
 
-            VectorizationService.VectorizationUsageResult result = vectorizationService.vectorizeWithUsage(
-                    fileMd5,
-                    fileUpload.getUserId(),
-                    fileUpload.getOrgTag(),
-                    fileUpload.isPublic(),
-                    requesterId
-            );
+                MultimodalVectorizationService.MultimodalVectorizationResult multimodalResult =
+                        multimodalVectorizationService.indexFile(
+                                fileMd5,
+                                fileUpload.getFileName(),
+                                fileUpload.getUserId(),
+                                fileUpload.getOrgTag(),
+                                fileUpload.isPublic(),
+                                requesterId
+                        );
+                result = toVectorizationUsageResult(multimodalResult);
+            }
             markVectorizationCompleted(fileUpload, result);
 
             logger.info(
@@ -238,9 +297,21 @@ public class DocumentService {
         }
     }
 
+    private VectorizationUsageResult toVectorizationUsageResult(
+            MultimodalVectorizationService.MultimodalVectorizationResult multimodalResult) {
+        if (multimodalResult == null) {
+            return new VectorizationUsageResult(0, 0, "multimodal:unknown");
+        }
+        return new VectorizationUsageResult(
+                multimodalResult.actualEmbeddingTokens(),
+                multimodalResult.actualItemCount(),
+                multimodalResult.modelVersion()
+        );
+    }
+
     @Transactional
     public FileUpload enqueueAsyncVectorizationRetry(String fileMd5, String requesterId) {
-        FileUpload fileUpload = fileUploadRepository.findFirstByFileMd5OrderByCreatedAtDesc(fileMd5)
+        FileUpload fileUpload = fileUploadRepository.findFirstByFileMd5AndUserIdOrderByCreatedAtDesc(fileMd5,requesterId)
                 .orElseThrow(() -> new RuntimeException("文件不存在"));
 
         markVectorizationProcessing(fileUpload, true);
@@ -253,7 +324,8 @@ public class DocumentService {
                 fileUpload.getOrgTag(),
                 fileUpload.isPublic(),
                 FileProcessingTask.TASK_TYPE_REINDEX,
-                requesterId
+                requesterId,
+                fileUpload.getId()
         );
 
         kafkaTemplate.executeInTransaction(kt -> {
@@ -271,9 +343,21 @@ public class DocumentService {
                 .orElseThrow(() -> new RuntimeException("文件不存在"));
         markVectorizationProcessing(fileUpload, resetActualUsage);
     }
+    @Transactional
+    public void markVectorizationProcessing(String fileMd5,String owner,boolean reset) {
+        markVectorizationProcessing(fileUploadRepository.findFirstByFileMd5AndUserIdOrderByCreatedAtDesc(fileMd5,owner).orElseThrow(),reset);
+    }
+    @Transactional
+    public void markVectorizationCompleted(String fileMd5,String owner,VectorizationUsageResult result) {
+        markVectorizationCompleted(fileUploadRepository.findFirstByFileMd5AndUserIdOrderByCreatedAtDesc(fileMd5,owner).orElseThrow(),result);
+    }
+    @Transactional
+    public void markVectorizationFailed(String fileMd5,String owner,Throwable error) {
+        fileUploadRepository.findFirstByFileMd5AndUserIdOrderByCreatedAtDesc(fileMd5,owner).ifPresent(file->markVectorizationFailed(file,error));
+    }
 
     @Transactional
-    public void markVectorizationCompleted(String fileMd5, VectorizationService.VectorizationUsageResult result) {
+    public void markVectorizationCompleted(String fileMd5, VectorizationUsageResult result) {
         FileUpload fileUpload = fileUploadRepository.findFirstByFileMd5OrderByCreatedAtDesc(fileMd5)
                 .orElseThrow(() -> new RuntimeException("文件不存在"));
         markVectorizationCompleted(fileUpload, result);
@@ -303,7 +387,7 @@ public class DocumentService {
         fileUploadRepository.save(fileUpload);
     }
 
-    private void markVectorizationCompleted(FileUpload fileUpload, VectorizationService.VectorizationUsageResult result) {
+    private void markVectorizationCompleted(FileUpload fileUpload, VectorizationUsageResult result) {
         fileUpload.setActualEmbeddingTokens((long) result.actualEmbeddingTokens());
         fileUpload.setActualChunkCount(result.actualChunkCount());
         fileUpload.setVectorizationStatus(FileUpload.VECTORIZATION_STATUS_COMPLETED);
@@ -368,23 +452,8 @@ public class DocumentService {
         try {
             backfillLegacyVectorizationStatuses();
 
-            User user = resolveUser(userId);
-            String userDbId = String.valueOf(user.getId());
-            
-            List<String> userEffectiveTags = orgTagCacheService.getUserEffectiveOrgTags(user.getUsername());
-            logger.debug("用户有效组织标签: {}", userEffectiveTags);
-            
-            // 使用有效标签查询文件
-            List<FileUpload> files;
-            if (userEffectiveTags.isEmpty()) {
-                // 如果用户没有任何组织标签，只返回自己的文件和公开文件
-                files = fileUploadRepository.findByUserIdOrIsPublicTrue(userDbId);
-                logger.debug("用户无组织标签，仅返回个人和公开文件");
-            } else {
-                // 查询用户可访问的所有文件（考虑层级标签）
-                files = fileUploadRepository.findAccessibleFilesWithTags(userDbId, userEffectiveTags);
-                logger.debug("使用有效组织标签查询文件");
-            }
+            // Preview and download must follow current membership, even when JWT/Redis still hold old tags.
+            List<FileUpload> files=knowledgeAccess.documents(knowledgeAccess.resolve(userId),List.of());
 
             files = deduplicateFileUploads(files);
             logger.info("成功获取用户可访问文件列表: userId={}, fileCount={}", userId, files.size());
@@ -716,6 +785,27 @@ public class DocumentService {
         } catch (Exception e) {
             logger.error("生成 PDF 单页预览失败: fileMd5={}, pageNumber={}", fileMd5, pageNumber, e);
             throw new RuntimeException("生成 PDF 单页预览失败: " + e.getMessage(), e);
+        }
+    }
+
+    public PdfEmbeddedImagePreview getPdfEmbeddedImagePreview(String fileMd5, int pageNumber, int imageSequence) {
+        logger.info("提取 PDF 内嵌图片预览: fileMd5={}, pageNumber={}, imageSequence={}",
+                fileMd5, pageNumber, imageSequence);
+
+        FileUpload fileUpload = fileUploadRepository.findFirstByFileMd5OrderByCreatedAtDesc(fileMd5)
+                .orElseThrow(() -> new RuntimeException("文件不存在: " + fileMd5));
+
+        try (InputStream inputStream = openFileStream(fileUpload)) {
+            PdfImageExtractionService.PdfEmbeddedImage image = pdfImageExtractionService.extractOne(
+                    inputStream,
+                    pageNumber,
+                    imageSequence
+            );
+            return new PdfEmbeddedImagePreview(image.bytes(), image.contentType());
+        } catch (Exception e) {
+            logger.error("提取 PDF 内嵌图片预览失败: fileMd5={}, pageNumber={}, imageSequence={}",
+                    fileMd5, pageNumber, imageSequence, e);
+            throw new RuntimeException("提取 PDF 内嵌图片预览失败: " + e.getMessage(), e);
         }
     }
     

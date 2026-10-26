@@ -63,7 +63,10 @@ public class OrgTagAuthorizationFilter extends OncePerRequestFilter {
                 path.matches(".*/documents/uploads.*") ||
                 path.matches(".*/documents/accessible.*") ||
                 path.matches(".*/documents/page-preview.*") ||
+                path.matches(".*/documents/embedded-image-preview.*") ||
                 path.matches(".*/search/hybrid.*") ||
+                path.matches(".*/search/multimodal.*") ||
+                path.matches(".*/knowledge(?:/.*)?") ||
                 (path.matches(".*/documents/[a-fA-F0-9]{32}.*") &&
                         ("DELETE".equals(request.getMethod()) || "POST".equals(request.getMethod())))) {
                 
@@ -80,8 +83,12 @@ public class OrgTagAuthorizationFilter extends OncePerRequestFilter {
                     operation = "获取可访问文档";
                 } else if (path.contains("/page-preview")) {
                     operation = "获取 PDF 单页预览";
+                } else if (path.contains("/embedded-image-preview")) {
+                    operation = "获取 PDF 内嵌图片预览";
                 } else if (path.contains("/search/hybrid")) {
                     operation = "混合检索";
+                } else if (path.contains("/search/multimodal")) {
+                    operation = "多模态检索";
                 } else if ("DELETE".equals(request.getMethod()) && path.matches(".*/documents/[a-fA-F0-9]{32}.*")) {
                     operation = "删除文档";
                 } else if ("POST".equals(request.getMethod()) && path.matches(".*/documents/[a-fA-F0-9]{32}/reindex.*")) {

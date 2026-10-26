@@ -83,10 +83,11 @@ public class UserTokenService {
         String value = stringRedisTemplate.opsForValue().get(key);
         if (StringUtils.isBlank(value)) {
             long initToken = resolveInitToken(userId, usageQuotaProperties.getLlm());
-            stringRedisTemplate.opsForValue().set(key, String.valueOf(initToken));
-            // 记录 Token 增加
-            recordTokenIncrease(userId, UserTokenRecord.TokenType.LLM, initToken, 0L, initToken, "注册赠送", null);
-            return initToken;
+            if (Boolean.TRUE.equals(stringRedisTemplate.opsForValue().setIfAbsent(key, String.valueOf(initToken)))) {
+                recordTokenIncrease(userId, UserTokenRecord.TokenType.LLM, initToken, 0L, initToken, "注册赠送", null);
+                return initToken;
+            }
+            return Long.parseLong(java.util.Objects.requireNonNull(stringRedisTemplate.opsForValue().get(key)));
         }
         try {
             return Long.parseLong(value);

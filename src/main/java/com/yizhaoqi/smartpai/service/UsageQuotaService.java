@@ -37,8 +37,16 @@ public class UsageQuotaService {
         this.properties = properties;
     }
 
+    public boolean isLlmUsageEnabled() {
+        return properties.getLlm().isEnabled();
+    }
+
+    public boolean isEmbeddingUsageEnabled() {
+        return properties.getEmbedding().isEnabled();
+    }
+
     public TokenReservation reserveLlmTokens(String userId, int estimatedPromptTokens, int maxCompletionTokens) {
-        if (!isQuotaManaged(userId) || !properties.getLlm().isEnabled()) {
+        if (!isQuotaManaged(userId) || !isLlmUsageEnabled()) {
             return TokenReservation.noop("llm", userId);
         }
 
@@ -49,7 +57,7 @@ public class UsageQuotaService {
     }
 
     public TokenReservation reserveEmbeddingTokens(String userId, List<String> texts) {
-        if (!isQuotaManaged(userId) || !properties.getEmbedding().isEnabled()) {
+        if (!isQuotaManaged(userId) || !isEmbeddingUsageEnabled()) {
             return TokenReservation.noop("embedding", userId);
         }
 
@@ -67,6 +75,10 @@ public class UsageQuotaService {
             long dayLimit,
             long dayWindowSeconds
     ) {
+        if (!isQuotaManaged(userId) || !isLlmUsageEnabled()) {
+            return TokenReservationBundle.noop("llm", userId);
+        }
+
         int reserveTokens = Math.max(estimatedPromptTokens, 0) + Math.max(maxCompletionTokens, 0);
         reserveTokens = Math.max(reserveTokens, 1);
 
@@ -107,6 +119,10 @@ public class UsageQuotaService {
             long dayLimit,
             long dayWindowSeconds
     ) {
+        if (!isQuotaManaged(userId) || !isEmbeddingUsageEnabled()) {
+            return TokenReservationBundle.noop(budgetScope, userId);
+        }
+
         int reserveTokens = Math.max(estimateEmbeddingTokens(texts), 1);
 
         List<TokenReservation> reservations = new java.util.ArrayList<>(3);
