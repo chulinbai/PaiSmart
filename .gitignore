@@ -76,8 +76,8 @@ src/main/resources/cert
 /.runtime
 
 
-/data
-/scr
+/data/*
+/scr/*
 start_service.bat
 stop_service.bat
-/minio_data
+/minio_data/*
